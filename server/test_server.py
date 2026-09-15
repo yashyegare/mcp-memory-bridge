@@ -1,6 +1,6 @@
 """
-Minimal MCP server, built with the official SDK, exposing exactly one
-dummy tool. Its only job is to give your hand-rolled client (in
+Minimal MCP server, built with the official SDK, exposing two dummy
+tools. Its only job is to give your hand-rolled client (in
 client/raw_client.py) something real to talk to over stdio.
 
 Run it directly to sanity-check it works:
@@ -10,9 +10,11 @@ Run it directly to sanity-check it works:
 Your own client should spawn this as a subprocess, not run it standalone.
 """
 
-from mcp.server.fastmcp import FastMCP
+# mcp 2.x note: FastMCP was renamed to MCPServer (the old import raises a
+# helpful ModuleNotFoundError pointing at the migration guide).
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("scratch-test-server")
+mcp = MCPServer("scratch-test-server")
 
 
 @mcp.tool()
