@@ -37,6 +37,8 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import numpy as np  # embeddings math (Phase 4A); trivial install, no heavy deps
+
 # mcp 2.x note: FastMCP was renamed to MCPServer (mcp 1.x import fails).
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
@@ -46,6 +48,8 @@ from mcp.server.mcpserver.exceptions import ToolError
 DB_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MCP_MEMORY_DB", "memory.db")
 BUSY_TIMEOUT_MS = int(os.environ.get("MCP_SQLITE_BUSY_TIMEOUT", "5000"))
 DEFAULT_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "anonymous")
+# Phase 4A: set MCP_EMBEDDINGS=off for a lean server with no ML dependencies.
+EMBEDDINGS_ENABLED = os.environ.get("MCP_EMBEDDINGS", "1") != "off"
 
 mcp = MCPServer("memory-server")
 
@@ -99,14 +103,62 @@ def _db() -> sqlite3.Connection:
                 id        INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
                 client_id TEXT NOT NULL,
-                action    TEXT NOT NULL,   -- 'set' | 'get' | 'delete'
+                action    TEXT NOT NULL,   -- 'set' | 'get' | 'delete' | 'search'
                 key       TEXT,
                 value     TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS fact_embeddings (
+                key       TEXT PRIMARY KEY,   -- mirrors facts.key
+                embedding BLOB NOT NULL       -- normalized float32 vector (384 dims)
             );
             """
         )
         _conn.commit()
     return _conn
+
+
+# ---------------------------------------------------------------------- #
+# Phase 4A: semantic recall                                              #
+# ---------------------------------------------------------------------- #
+# all-MiniLM-L6-v2, 384-dim embeddings, ~80MB, CPU-friendly. The model is
+# loaded LAZILY (first embed call) and kept as a singleton: loading at
+# server start would tax every client spawn (~10s import + ~16s model load
+# + ~500MB RAM), and each MCP client spawns its own server subprocess.
+# With the cache warm, first embed is a few seconds and subsequent ones
+# are milliseconds -- never per-call loading, per the design note.
+_model = None
+
+
+def _embed(texts: list[str]):
+    """Embed texts as normalized float32 numpy vectors (cosine-ready)."""
+    global _model
+    if _model is None:
+        if not EMBEDDINGS_ENABLED:
+            raise ToolError(
+                "semantic search is disabled on this server (MCP_EMBEDDINGS=off); "
+                "use memory_list with a key prefix instead"
+            )
+        # Offline mode unless overridden: the model is cached after the first
+        # run, and letting HF Hub do a network freshness check on load risks
+        # hanging the first tool call on a flaky network (observed here).
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        from sentence_transformers import SentenceTransformer  # deferred heavy import
+
+        _model = SentenceTransformer("all-MiniLM-L6-v2")
+    vectors = _model.encode(texts, normalize_embeddings=True)
+    return vectors.astype("float32")
+
+
+def _remember_search(query: str, matched_key: str, score: float) -> None:
+    """Log a search event with the query and its best match (audit trail
+    for semantic recall: what was asked, in which words, and what won)."""
+    db = _db()
+    with db:
+        db.execute(
+            "INSERT INTO events (timestamp, client_id, action, key, value) VALUES (?, ?, 'search', ?, ?)",
+            (_now(), DEFAULT_CLIENT_ID, matched_key, f"query={query!r} score={score:.3f}"),
+        )
 
 
 def _log(client_id: str, action: str, key: str | None, value: str | None) -> None:
@@ -169,13 +221,22 @@ def _tool_guard(fn):
 def _guarded_set(key: str, value: str, client_id: str | None = None) -> str:
     cid = client_id or DEFAULT_CLIENT_ID
     db = _db()
-    with db:  # transaction: fact update + event insert commit or roll back together
+    # Embed BEFORE opening the write transaction: the first call loads the
+    # model (~seconds) and must not hold SQLite's write lock while doing it.
+    embedding = _embed([f"{key}: {value}"])[0].tobytes() if EMBEDDINGS_ENABLED else None
+    with db:  # transaction: fact update + event insert (+ embedding) commit together
         db.execute(
             "INSERT INTO facts (key, value, source_client, updated_at) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
             "source_client=excluded.source_client, updated_at=excluded.updated_at",
             (key, value, cid, _now()),
         )
+        if embedding is not None:
+            db.execute(
+                "INSERT INTO fact_embeddings (key, embedding) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET embedding=excluded.embedding",
+                (key, embedding),
+            )
         _log(cid, "set", key, value)
     return f"set {key!r} (from {cid})"
 
@@ -230,12 +291,65 @@ def memory_list(prefix: str = "") -> str:
 
 @mcp.tool()
 @_tool_guard
+def memory_search(query: str, top_k: int = 3) -> str:
+    """Find facts by MEANING, not key: embeds the query and returns the
+    top_k most similar facts by cosine similarity. Works with different
+    words than were stored (e.g. query 'appearance preference' finds
+    key 'user/theme')."""
+    if not EMBEDDINGS_ENABLED:
+        raise ToolError(
+            "semantic search is disabled on this server (MCP_EMBEDDINGS=off); "
+            "use memory_list with a key prefix instead"
+        )
+    rows = _db().execute(
+        "SELECT f.key, f.value, f.source_client, f.updated_at, e.embedding "
+        "FROM facts f JOIN fact_embeddings e ON e.key = f.key"
+    ).fetchall()
+    if not rows:
+        return "(no searchable facts stored yet)"
+    query_vec = _embed([query])[0]
+    scored = []
+    for row in rows:
+        vec = np.frombuffer(row["embedding"], dtype="float32")
+        score = float(np.dot(query_vec, vec))  # both normalized: dot == cosine
+        scored.append((score, row))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    top = scored[: max(1, top_k)]
+    best_key, best_score = top[0][1]["key"], top[0][0]
+    _remember_search(query, best_key, best_score)
+    lines = [
+        f"{row['key']} = {row['value']}  (cosine {score:.3f}, source: {row['source_client']})"
+        for score, row in top
+    ]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_tool_guard
+def memory_history(key: str, include_reads: bool = False) -> str:
+    """Full audit trail for one key: every set/delete event in order, with
+    attribution -- who wrote what, when. include_reads=True also shows
+    every get and every semantic-search hit on this key (verbose)."""
+    actions = "('set', 'get', 'delete', 'search')" if include_reads else "('set', 'delete')"
+    rows = _db().execute(
+        f"SELECT timestamp, client_id, action, value FROM events "
+        f"WHERE key = ? AND action IN {actions} ORDER BY id",
+        (key,),
+    ).fetchall()
+    if not rows:
+        return f"(no recorded history for key {key!r})"
+    return "\n".join(f"{r['timestamp']} {r['client_id']:>14} {r['action']:>6}: {r['value']}" for r in rows)
+
+
+@mcp.tool()
+@_tool_guard
 def memory_delete(key: str, client_id: str | None = None) -> str:
     """Delete a fact by key. No-op if the key doesn't exist (still logged)."""
     cid = client_id or DEFAULT_CLIENT_ID
     db = _db()
     with db:
         cur = db.execute("DELETE FROM facts WHERE key = ?", (key,))
+        db.execute("DELETE FROM fact_embeddings WHERE key = ?", (key,))  # keep vectors in sync
         _log(cid, "delete", key, None)
     if cur.rowcount == 0:
         return f"nothing to delete for {key!r} (logged from {cid})"
@@ -245,7 +359,7 @@ def memory_delete(key: str, client_id: str | None = None) -> str:
 # Demo-only tool for the Phase 3 lock experiment: holds the SQLite write
 # lock open for N seconds, so another client's write deterministically
 # collides with it. Enable with MCP_ENABLE_DEMO_TOOLS=1; not registered
-# otherwise so the production surface stays exactly the four memory tools.
+# otherwise so the production tool surface stays the memory tools only.
 if os.environ.get("MCP_ENABLE_DEMO_TOOLS") == "1":
 
     @mcp.tool()
@@ -265,6 +379,24 @@ if os.environ.get("MCP_ENABLE_DEMO_TOOLS") == "1":
         return f"held the write lock for {seconds}s (client {DEFAULT_CLIENT_ID!r})"
 
 
+def _maybe_preload_model() -> None:
+    """With MCP_PRELOAD_MODEL=1, load the embedding model in a background
+    thread at startup: the server still starts instantly, but the model is
+    (usually) ready by the first real tool call, so clients never see the
+    ~25s cold load on their first memory_set."""
+    if not (EMBEDDINGS_ENABLED and os.environ.get("MCP_PRELOAD_MODEL") == "1"):
+        return
+
+    def _load():
+        try:
+            _embed(["preload"])
+            print("embedding model preloaded", file=sys.stderr)
+        except Exception as exc:  # preload is best-effort; lazy load still works
+            print(f"embedding model preload failed: {exc}", file=sys.stderr)
+
+    threading.Thread(target=_load, daemon=True).start()
+
+
 if __name__ == "__main__":
     # Avoid stray print()s: stdout is the protocol channel.
     print(
@@ -272,4 +404,5 @@ if __name__ == "__main__":
         f"client_id={DEFAULT_CLIENT_ID!r}",
         file=sys.stderr,
     )
+    _maybe_preload_model()
     mcp.run(transport="stdio")

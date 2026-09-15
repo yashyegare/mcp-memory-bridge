@@ -52,7 +52,10 @@ class RawMCPClient:
         self,
         server_command: list[str],
         protocol_version: str = "2025-11-25",
-        default_timeout: float = 10.0,
+        # 45s: the first semantic-search-enabled tool call loads an ~80MB
+        # embedding model (~25s cold). Hung-server protection is still
+        # available via an explicit shorter timeout (see the tests).
+        default_timeout: float = 45.0,
         env: dict[str, str] | None = None,
         capture_stderr: bool = True,
     ):

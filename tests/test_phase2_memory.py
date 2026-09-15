@@ -16,7 +16,12 @@ def _text(result: dict) -> str:
 
 
 def _memory_client(make_client, tmp_path):
-    client = make_client([sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")])
+    # MCP_EMBEDDINGS=off: these tests exercise storage/concurrency, not the
+    # embedding model (loading it per test would add ~25s each).
+    client = make_client(
+        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        env={"MCP_EMBEDDINGS": "off"},
+    )
     client.initialize()
     return client
 
@@ -107,13 +112,14 @@ def _contended_lock_scenario(make_client, tmp_path, extra_env):
     import threading
     import time
 
+    env = {"MCP_EMBEDDINGS": "off", **extra_env}
     a = make_client(
         [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
-        env={**extra_env, "MCP_CLIENT_ID": "A"},
+        env={**env, "MCP_CLIENT_ID": "A"},
     )
     b = make_client(
         [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
-        env={**extra_env, "MCP_CLIENT_ID": "B"},
+        env={**env, "MCP_CLIENT_ID": "B"},
     )
     a.initialize()
     b.initialize()

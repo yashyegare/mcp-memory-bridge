@@ -10,6 +10,8 @@ on libraries that hide the interesting parts.
 ```bash
 python -m venv venv
 venv\Scripts\pip install mcp pytest
+# optional, for Phase 4A semantic recall (downloads the ~80MB model on first use):
+venv\Scripts\pip install sentence-transformers
 ```
 
 All commands below use `venv\Scripts\python.exe` explicitly — bare `python`
@@ -23,9 +25,12 @@ client/
                       #   stdlib only — no mcp SDK import anywhere in it
 server/
   test_server.py      # trivial SDK server (echo, add) — Phase 1 target
-  memory_server.py    # SQLite-backed shared memory server — Phase 2
+  memory_server.py    # SQLite-backed shared memory server — Phases 2/3/4
 tools/
-  stress_concurrent.py# multi-client write race harness — Phase 3
+  stress_concurrent.py # multi-client write race harness — Phase 3
+  live_hammer.py       # timed hammer for the live Claude Desktop race
+  lock_demo.py         # deterministic lock-contention demo
+  inspect_memory.py    # pretty-print the store/history/search log — Phase 4B
 tests/                # pytest integration tests (real subprocesses, real wire)
 ```
 
@@ -174,11 +179,48 @@ restart, the connector UI shows `memory_get/set/list/delete`; ask it to
 `memory_set` a key, then watch the attribution and ordering land in your
 raw client's `memory_get(key, include_events=True)`.
 
+## Phase 4 — semantic recall + audit CLI (done)
+
+The memory server now finds facts by **meaning**, not just exact keys.
+Every `memory_set` embeds the fact (all-MiniLM-L6-v2, 384-dim, stored as a
+BLOB in `fact_embeddings`); `memory_search(query, top_k)` embeds the query
+and returns the best facts by cosine similarity — plain numpy, no vector
+DB. Live proof, through the raw client:
+
+```
+query: "appearance preference for screens"  (those words appear in NO stored fact)
+  user/theme = the user prefers dark mode interfaces  (cosine 0.427)
+  pet/name  = Fluffy is a tabby cat                  (cosine 0.036)
+```
+
+Design notes: the model loads **lazily** on first use (per-process singleton)
+— loading at startup would tax every client spawn, since each MCP client
+runs its own server subprocess. `HF_HUB_OFFLINE=1` is forced once the model
+is cached, so a flaky network can never hang a tool call. Set
+`MCP_EMBEDDINGS=off` for a lean server with no ML dependencies; set
+`MCP_PRELOAD_MODEL=1` if your host prefers paying the load at spawn instead
+of on first call. Every search is audit-logged (query, winner, score).
+
+Phase 4B rode along nearly free (the events table already existed):
+`memory_history(key, include_reads)` exposes per-key attribution history as
+a tool, and `tools\inspect_memory.py` pretty-prints the store directly:
+
+```bash
+venv\Scripts\python.exe tools\inspect_memory.py --db memory.db            # overview
+venv\Scripts\python.exe tools\inspect_memory.py --key live/color          # one key's history
+venv\Scripts\python.exe tools\inspect_memory.py --searches                # semantic search log
+```
+
 ## Tests
 
 ```bash
 venv\Scripts\python.exe -m pytest tests\ -v
 ```
+
+19 integration tests across four phases. Non-semantic tests run with
+`MCP_EMBEDDINGS=off` so the suite doesn't pay the model load per test; one
+combined lifecycle test covers the full semantic path (meaning-based hit,
+audit log, delete cascade).
 
 Integration tests only: each test spawns a real server subprocess and speaks
 the real protocol. A silent (hung) server is tested too — the client must
@@ -208,6 +250,16 @@ time out, not hang.
   HTTP transport would change that); values are plain TEXT (no sizes/typing);
   `memory_list`'s prefix match escapes `%`/`_` but remains a plain LIKE scan
   (fine at this scale).
+- **Semantic recall without a vector DB.** Embeddings live in a plain
+  SQLite table and search is a brute-force cosine scan in numpy — at
+  hundreds-to-low-thousands of facts that is sub-10ms and needs zero extra
+  infrastructure. The embedding text is `"key: value"` so key names
+  contribute signal. A real ANN index (FAISS/hnswlib) is the upgrade path
+  if the store grows, not a day-one need.
+- **Lazy model loading, offline by default.** Server startup stays instant
+  (~1s) regardless of ML stack; the ~25s model load happens once, on first
+  embedding use, per server process. HF Hub is put in offline mode once the
+  model is cached so tool calls can never hang on a network check.
 - **What broke in Phase 3, precisely.** With `busy_timeout=0`, contention
   turns into immediate, legible tool-level rejections (the fail-fast policy
   you'd pick if overwrites were unacceptable); with the default 5s, the same
