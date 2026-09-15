@@ -33,6 +33,8 @@ import functools
 import os
 import sqlite3
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 
 # mcp 2.x note: FastMCP was renamed to MCPServer (mcp 1.x import fails).
@@ -50,7 +52,19 @@ mcp = MCPServer("memory-server")
 # One connection per server process. The SDK serves all sessions of this
 # subprocess on one event loop, so a single connection with a busy timeout
 # serializes writes correctly; WAL mode (below) keeps readers unblocked.
+#
+# THREADING BUG (found live, via MCP_DEBUG_LOG): the SDK dispatches tool
+# calls onto different worker threads under load. python's sqlite3 forbids
+# sharing a connection across threads by default, so any call landing on a
+# thread other than the connection's creator crashed with ProgrammingError
+# ("SQLite objects created in a thread can only be used in that same
+# thread") -- and worse, it only failed SOMETIMES, because early low-traffic
+# calls happened to land on the creating thread. Fix: check_same_thread=
+# False + one lock serializing every tool call (python sqlite3 connections
+# still need user-level serialization; this also matches SQLite's
+# single-writer model, so it costs nothing in practice).
 _conn: sqlite3.Connection | None = None
+_SERVER_LOCK = threading.RLock()
 
 
 def _now() -> str:
@@ -64,7 +78,11 @@ def _db() -> sqlite3.Connection:
         # busy_timeout: how long a write waits for the lock before raising
         # "database is locked". 0ms = fail fast (for experiments), default
         # 5s = queue concurrent writers (the production setting).
-        _conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_MS / 1000.0)
+        _conn = sqlite3.connect(
+            DB_PATH,
+            timeout=BUSY_TIMEOUT_MS / 1000.0,
+            check_same_thread=False,  # SDK dispatches calls across threads; _SERVER_LOCK serializes
+        )
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL;")      # readers don't block the writer
         _conn.execute("PRAGMA synchronous=NORMAL;")    # WAL-safe durability trade-off
@@ -98,34 +116,57 @@ def _log(client_id: str, action: str, key: str | None, value: str | None) -> Non
     )
 
 
-def _translate_sqlite_errors(fn):
-    """mcp 2.x flattens arbitrary tool exceptions to 'Error executing tool
-    <name>', losing the message entirely. ToolError survives -- the SDK
-    prefixes it ('Error executing tool <name>: ...') but keeps the detail.
-    Translate lock errors into ToolError so clients can read and act on
-    them."""
+def _tool_guard(fn):
+    """Two jobs:
+
+    1. Trace every tool call (args, outcome, exceptions) to the file named
+       by MCP_DEBUG_LOG when set -- our forensic recorder for client-side
+       sessions whose stderr we can't see (e.g. Claude Desktop).
+    2. mcp 2.x flattens arbitrary tool exceptions to 'Error executing tool
+       <name>', losing the message entirely. ToolError survives -- the SDK
+       prefixes it ('Error executing tool <name>: ...') but keeps the
+       detail. Translate lock errors into ToolError so clients can read
+       and act on them.
+    """
 
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
+        debug_path = os.environ.get("MCP_DEBUG_LOG")
+        start = time.time()
         try:
-            return fn(*args, **kwargs)
-        except sqlite3.OperationalError as exc:
+            with _SERVER_LOCK:  # serialize all db access across SDK worker threads
+                result = fn(*args, **kwargs)
+            if debug_path:
+                with open(debug_path, "a", encoding="utf-8") as f:
+                    f.write(f"{_now()} OK   {fn.__name__} args={args} kwargs={kwargs} "
+                            f"({time.time() - start:.3f}s) -> {str(result)[:200]}\n")
+            return result
+        except sqlite3.OperationalError as exc:  # outside the lock: nothing db-related to serialize
+            if debug_path:
+                import traceback
+                with open(debug_path, "a", encoding="utf-8") as f:
+                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={kwargs} "
+                            f"({time.time() - start:.3f}s) {type(exc).__name__}: {exc}\n")
             if "locked" in str(exc) or "busy" in str(exc):
                 raise ToolError(
                     f"database is locked (busy_timeout={BUSY_TIMEOUT_MS}ms): {exc}. "
                     "Another client holds the write lock; retry with backoff."
                 ) from None
             raise
+        except BaseException as exc:  # record everything, then surface it
+            if debug_path:
+                import traceback
+                with open(debug_path, "a", encoding="utf-8") as f:
+                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={kwargs} "
+                            f"({time.time() - start:.3f}s) {type(exc).__name__}: {exc}\n"
+                            f"{''.join(traceback.format_exc())}\n")
+            raise
 
     return wrapper
 
 
-@mcp.tool()
-@_translate_sqlite_errors
-def memory_set(key: str, value: str, client_id: str | None = None) -> str:
-    """Store a fact (last-write-wins). Overwrites any existing value for
-    `key`; the write is attributed to `client_id` (defaults to this
-    server's MCP_CLIENT_ID env setting) and logged to events."""
+@_tool_guard
+def _guarded_set(key: str, value: str, client_id: str | None = None) -> str:
     cid = client_id or DEFAULT_CLIENT_ID
     db = _db()
     with db:  # transaction: fact update + event insert commit or roll back together
@@ -140,7 +181,16 @@ def memory_set(key: str, value: str, client_id: str | None = None) -> str:
 
 
 @mcp.tool()
-@_translate_sqlite_errors
+@_tool_guard
+def memory_set(key: str, value: str, client_id: str | None = None) -> str:
+    """Store a fact (last-write-wins). Overwrites any existing value for
+    `key`; the write is attributed to `client_id` (defaults to this
+    server's MCP_CLIENT_ID env setting) and logged to events."""
+    return _guarded_set(key, value, client_id)
+
+
+@mcp.tool()
+@_tool_guard
 def memory_get(key: str, include_events: bool = False) -> str:
     """Fetch a fact by exact key. With include_events=True, appends the
     key's full write history from the events log."""
@@ -165,7 +215,7 @@ def memory_get(key: str, include_events: bool = False) -> str:
 
 
 @mcp.tool()
-@_translate_sqlite_errors
+@_tool_guard
 def memory_list(prefix: str = "") -> str:
     """List facts whose key starts with `prefix` (all facts if empty)."""
     rows = _db().execute(
@@ -179,7 +229,7 @@ def memory_list(prefix: str = "") -> str:
 
 
 @mcp.tool()
-@_translate_sqlite_errors
+@_tool_guard
 def memory_delete(key: str, client_id: str | None = None) -> str:
     """Delete a fact by key. No-op if the key doesn't exist (still logged)."""
     cid = client_id or DEFAULT_CLIENT_ID
@@ -199,7 +249,7 @@ def memory_delete(key: str, client_id: str | None = None) -> str:
 if os.environ.get("MCP_ENABLE_DEMO_TOOLS") == "1":
 
     @mcp.tool()
-    @_translate_sqlite_errors
+    @_tool_guard
     def lock_hold(seconds: float = 2.0) -> str:
         """[demo] Hold the SQLite write lock for `seconds`, then commit."""
         db = _db()
