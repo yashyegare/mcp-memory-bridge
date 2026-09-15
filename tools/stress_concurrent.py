@@ -29,9 +29,11 @@ DEFAULT_DB = "stress.db"
 PYTHON = sys.executable
 
 
-def run_writer(writer_id: str, db_path: str, key: str, n_writes: int) -> dict:
+def run_writer(writer_id: str, db_path: str, key: str, n_writes: int, capture_stderr: bool = True) -> dict:
     """One client process-worth of writes: set key=i then immediately get it."""
-    client = RawMCPClient([PYTHON, "server/memory_server.py", db_path])
+    client = RawMCPClient(
+        [PYTHON, "server/memory_server.py", db_path], capture_stderr=capture_stderr
+    )
     observed: list[int] = []
     errors: list[str] = []
     try:
@@ -63,6 +65,11 @@ def main() -> None:
     parser.add_argument("--writes", type=int, default=40)
     parser.add_argument("--key", default="stress/shared-key")
     parser.add_argument("--db", default=DEFAULT_DB)
+    parser.add_argument(
+        "--devnull-stderr",
+        action="store_true",
+        help="drain server stderr to devnull (tests the stderr-wedge hypothesis)",
+    )
     args = parser.parse_args()
 
     print(f"spawning {args.clients} clients x {args.writes} writes on key {args.key!r} (db: {args.db})")
@@ -72,7 +79,10 @@ def main() -> None:
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.clients) as pool:
         results = list(
             pool.map(
-                lambda i: run_writer(f"client-{i}", args.db, args.key, args.writes),
+                lambda i: run_writer(
+                    f"client-{i}", args.db, args.key, args.writes,
+                    capture_stderr=not args.devnull_stderr,
+                ),
                 range(args.clients),
             )
         )

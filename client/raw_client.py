@@ -30,6 +30,7 @@ Reference: https://modelcontextprotocol.io/specification
 
 import json
 import itertools
+import os
 import queue
 import subprocess
 import sys
@@ -47,16 +48,32 @@ class MCPError(Exception):
 
 
 class RawMCPClient:
-    def __init__(self, server_command: list[str], protocol_version: str = "2025-11-25", default_timeout: float = 10.0):
+    def __init__(
+        self,
+        server_command: list[str],
+        protocol_version: str = "2025-11-25",
+        default_timeout: float = 10.0,
+        env: dict[str, str] | None = None,
+        capture_stderr: bool = True,
+    ):
         self.protocol_version = protocol_version
         self.default_timeout = default_timeout
+        # env entries are overlaid on top of the parent environment (so PATH
+        # etc. survive) -- this is how per-client server config like
+        # MCP_CLIENT_ID gets through, mirroring Claude Desktop's "env" key.
+        child_env = {**os.environ, **(env or {})}
         self.proc = subprocess.Popen(
             server_command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            # capture_stderr=False => DEVNULL. Diagnostic option: an undrained
+            # stderr PIPE can fill its OS buffer and BLOCK the server the
+            # moment it logs more than ~64KB (e.g. a tool erroring on every
+            # call). Real hosts drain stderr continuously; see README.
+            stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
             text=True,
             bufsize=1,  # line-buffered
+            env=child_env,
         )
         self._id_counter = itertools.count(1)
         # A server can write notifications (or its own requests) to stdout

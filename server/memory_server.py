@@ -29,6 +29,7 @@ Run it (usually via your client, not directly):
     venv\\Scripts\\python.exe server/memory_server.py [path/to/memory.db]
 """
 
+import functools
 import os
 import sqlite3
 import sys
@@ -38,7 +39,11 @@ from datetime import datetime, timezone
 from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
-DB_PATH = sys.argv[1] if len(sys.argv) > 1 else "memory.db"
+# Config via argv > env > defaults, so Claude Desktop / any launcher can
+# configure this server without touching code.
+DB_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MCP_MEMORY_DB", "memory.db")
+BUSY_TIMEOUT_MS = int(os.environ.get("MCP_SQLITE_BUSY_TIMEOUT", "5000"))
+DEFAULT_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "anonymous")
 
 mcp = MCPServer("memory-server")
 
@@ -56,7 +61,10 @@ def _now() -> str:
 def _db() -> sqlite3.Connection:
     global _conn
     if _conn is None:
-        _conn = sqlite3.connect(DB_PATH, timeout=5.0)  # busy_timeout, in seconds
+        # busy_timeout: how long a write waits for the lock before raising
+        # "database is locked". 0ms = fail fast (for experiments), default
+        # 5s = queue concurrent writers (the production setting).
+        _conn = sqlite3.connect(DB_PATH, timeout=BUSY_TIMEOUT_MS / 1000.0)
         _conn.row_factory = sqlite3.Row
         _conn.execute("PRAGMA journal_mode=WAL;")      # readers don't block the writer
         _conn.execute("PRAGMA synchronous=NORMAL;")    # WAL-safe durability trade-off
@@ -90,28 +98,54 @@ def _log(client_id: str, action: str, key: str | None, value: str | None) -> Non
     )
 
 
+def _translate_sqlite_errors(fn):
+    """mcp 2.x flattens arbitrary tool exceptions to 'Error executing tool
+    <name>', losing the message entirely. ToolError survives -- the SDK
+    prefixes it ('Error executing tool <name>: ...') but keeps the detail.
+    Translate lock errors into ToolError so clients can read and act on
+    them."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            if "locked" in str(exc) or "busy" in str(exc):
+                raise ToolError(
+                    f"database is locked (busy_timeout={BUSY_TIMEOUT_MS}ms): {exc}. "
+                    "Another client holds the write lock; retry with backoff."
+                ) from None
+            raise
+
+    return wrapper
+
+
 @mcp.tool()
-def memory_set(key: str, value: str, client_id: str = "anonymous") -> str:
+@_translate_sqlite_errors
+def memory_set(key: str, value: str, client_id: str | None = None) -> str:
     """Store a fact (last-write-wins). Overwrites any existing value for
-    `key`; the write is attributed to `client_id` and logged to events."""
+    `key`; the write is attributed to `client_id` (defaults to this
+    server's MCP_CLIENT_ID env setting) and logged to events."""
+    cid = client_id or DEFAULT_CLIENT_ID
     db = _db()
     with db:  # transaction: fact update + event insert commit or roll back together
         db.execute(
             "INSERT INTO facts (key, value, source_client, updated_at) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
             "source_client=excluded.source_client, updated_at=excluded.updated_at",
-            (key, value, client_id, _now()),
+            (key, value, cid, _now()),
         )
-        _log(client_id, "set", key, value)
-    return f"set {key!r} (from {client_id})"
+        _log(cid, "set", key, value)
+    return f"set {key!r} (from {cid})"
 
 
 @mcp.tool()
+@_translate_sqlite_errors
 def memory_get(key: str, include_events: bool = False) -> str:
     """Fetch a fact by exact key. With include_events=True, appends the
     key's full write history from the events log."""
     row = _db().execute("SELECT value, source_client, updated_at FROM facts WHERE key = ?", (key,)).fetchone()
-    _log("anonymous", "get", key, None)  # reads are logged too, unattributed by default
+    _log(DEFAULT_CLIENT_ID, "get", key, None)  # reads are logged too, attributed to this server's client
     _db().commit()
     if row is None:
         # ToolError => isError=true with this message intact (mcp 2.x drops
@@ -131,6 +165,7 @@ def memory_get(key: str, include_events: bool = False) -> str:
 
 
 @mcp.tool()
+@_translate_sqlite_errors
 def memory_list(prefix: str = "") -> str:
     """List facts whose key starts with `prefix` (all facts if empty)."""
     rows = _db().execute(
@@ -144,18 +179,47 @@ def memory_list(prefix: str = "") -> str:
 
 
 @mcp.tool()
-def memory_delete(key: str, client_id: str = "anonymous") -> str:
+@_translate_sqlite_errors
+def memory_delete(key: str, client_id: str | None = None) -> str:
     """Delete a fact by key. No-op if the key doesn't exist (still logged)."""
+    cid = client_id or DEFAULT_CLIENT_ID
     db = _db()
     with db:
         cur = db.execute("DELETE FROM facts WHERE key = ?", (key,))
-        _log(client_id, "delete", key, None)
+        _log(cid, "delete", key, None)
     if cur.rowcount == 0:
-        return f"nothing to delete for {key!r} (logged from {client_id})"
-    return f"deleted {key!r} (from {client_id})"
+        return f"nothing to delete for {key!r} (logged from {cid})"
+    return f"deleted {key!r} (from {cid})"
+
+
+# Demo-only tool for the Phase 3 lock experiment: holds the SQLite write
+# lock open for N seconds, so another client's write deterministically
+# collides with it. Enable with MCP_ENABLE_DEMO_TOOLS=1; not registered
+# otherwise so the production surface stays exactly the four memory tools.
+if os.environ.get("MCP_ENABLE_DEMO_TOOLS") == "1":
+
+    @mcp.tool()
+    @_translate_sqlite_errors
+    def lock_hold(seconds: float = 2.0) -> str:
+        """[demo] Hold the SQLite write lock for `seconds`, then commit."""
+        db = _db()
+        db.execute("BEGIN IMMEDIATE")  # grab the write lock and keep it
+        db.execute(
+            "INSERT INTO events (timestamp, client_id, action, key, value) VALUES (?, ?, 'demo-lock-hold', NULL, NULL)",
+            (_now(), DEFAULT_CLIENT_ID),
+        )
+        import time
+
+        time.sleep(seconds)
+        db.commit()  # releases the lock
+        return f"held the write lock for {seconds}s (client {DEFAULT_CLIENT_ID!r})"
 
 
 if __name__ == "__main__":
     # Avoid stray print()s: stdout is the protocol channel.
-    print(f"memory server: db={os.path.abspath(DB_PATH)}", file=sys.stderr)
+    print(
+        f"memory server: db={os.path.abspath(DB_PATH)} busy_timeout={BUSY_TIMEOUT_MS}ms "
+        f"client_id={DEFAULT_CLIENT_ID!r}",
+        file=sys.stderr,
+    )
     mcp.run(transport="stdio")

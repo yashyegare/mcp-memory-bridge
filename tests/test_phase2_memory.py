@@ -99,3 +99,71 @@ def test_events_log_records_writes(make_client, tmp_path):
     finally:
         db.close()
     assert rows == [("tester", "set", "k", "v")]
+
+
+def _contended_lock_scenario(make_client, tmp_path, extra_env):
+    """Shared setup: two clients on one db; client B is inside lock_hold,
+    actively holding the SQLite write lock, when this returns."""
+    import threading
+    import time
+
+    a = make_client(
+        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        env={**extra_env, "MCP_CLIENT_ID": "A"},
+    )
+    b = make_client(
+        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        env={**extra_env, "MCP_CLIENT_ID": "B"},
+    )
+    a.initialize()
+    b.initialize()
+    a.call_tool("memory_set", {"key": "warm", "value": "1"})  # create schema
+
+    done = threading.Event()
+
+    def run_b():
+        b.call_tool("lock_hold", {"seconds": 1.0})
+        done.set()
+
+    t = threading.Thread(target=run_b)
+    t.start()
+    time.sleep(0.5)  # B is now inside its write transaction, holding the lock
+    return a, b, t, done
+
+
+def test_busy_timeout_zero_fails_fast_on_contended_lock(make_client, tmp_path):
+    """The break, on demand: busy_timeout=0 + a held lock => the write comes
+    back as a tool-level error whose MESSAGE survives (ToolError), unlike a
+    raw sqlite3.OperationalError which mcp 2.x would flatten."""
+    env = {"MCP_SQLITE_BUSY_TIMEOUT": "0", "MCP_ENABLE_DEMO_TOOLS": "1"}
+    a, _b, t, done = _contended_lock_scenario(make_client, tmp_path, env)
+    try:
+        result = a.call_tool("memory_set", {"key": "x", "value": "y"})
+        assert result.get("isError") is True, f"expected lock error, got: {result}"
+        message = _text(result)
+        assert "locked" in message.lower()
+        # What matters is that the DETAIL survived. mcp 2.x prefixes even
+        # ToolError messages with 'Error executing tool <name>: ', but keeps
+        # the rest -- arbitrary exceptions would leave ONLY that prefix.
+        assert "retry with backoff" in message
+    finally:
+        t.join()
+        assert done.is_set()
+
+
+def test_busy_timeout_default_queues_writers(make_client, tmp_path):
+    """The fix: with the default 5s busy_timeout, a write that arrives while
+    another client holds the lock simply waits and then succeeds."""
+    import time
+
+    env = {"MCP_ENABLE_DEMO_TOOLS": "1"}  # default MCP_SQLITE_BUSY_TIMEOUT=5000
+    a, _b, t, done = _contended_lock_scenario(make_client, tmp_path, env)
+    try:
+        start = time.monotonic()
+        result = a.call_tool("memory_set", {"key": "x", "value": "y"})
+        elapsed = time.monotonic() - start
+        assert result.get("isError") is not True
+        assert elapsed >= 0.4  # it really did wait out the held lock
+    finally:
+        t.join()
+        assert done.is_set()
