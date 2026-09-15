@@ -66,7 +66,47 @@ renamed to `MCPServer` (`from mcp.server.mcpserver import MCPServer`). Most
 tutorials online still show the 1.x `FastMCP` import, which raises a
 `ModuleNotFoundError` on 2.x.
 
-## Phase 3 — two clients, one server (done: we broke it on purpose)
+## Phase 3 — two clients, one server (done: live run with Claude Desktop)
+
+**The live experiment:** raw client hammering `live/color` every 300ms
+(`tools/live_hammer.py`, each write attributed `raw-hammer`) while Claude
+Desktop — registered via `mcpServers` in `claude_desktop_config.json` with
+`MCP_CLIENT_ID=claude-desktop` — was asked, mid-stream, to set the same key
+to `magenta` and read it back. All from the shared `memory.db`.
+
+What the shared events log showed:
+
+```
+#4279 09:21:59.401 raw-hammer      set: live/color=hammer-305
+#4281 09:21:59.583 claude-desktop  set: live/color=magenta   <- mid-stream
+#4282 09:21:59.707 raw-hammer      set: live/color=hammer-306  <- 124ms later
+...
+```
+
+- Desktop's write landed **between** two hammer writes and was the live
+  value for **124ms** before last-write-wins overwrote it.
+- Desktop then read the key back 2.2s later and got `hammer-312` — its own
+  write gone. The second client **observed the overwrite happening**, in its
+  own conversation, attributed end to end by the events table.
+- Zero transport/protocol errors on either side across ~2,500 total writes:
+  WAL + 5s busy_timeout + LWW absorbed everything.
+
+Two real bugs surfaced on the way, both general MCP lessons:
+
+1. **Stale spawned servers.** Config changes don't reach servers Desktop
+   spawned before the edit — it keeps subprocesses from the old spawn spec.
+   Fix: kill the spawned server processes (or fully restart the host) after
+   editing `claude_desktop_config.json`. Symptom: connector exists, tools
+   list, every call errors for no visible reason.
+2. **Cross-thread SQLite crash** (see commit `cb94544`): the SDK dispatches
+   tool calls onto different worker threads under load; python's sqlite3
+   forbids cross-thread connection sharing by default. Failed only under
+   load — early calls landed on the creating thread by luck. Diagnosed via
+   the `MCP_DEBUG_LOG` server-side forensic recorder, which captures every
+   tool call's args/timing/traceback regardless of what the host does with
+   the server's stderr.
+
+**Reproduce the deterministic version** (no Claude Desktop needed):
 
 **Configuration** (per client, via env — Claude Desktop's `mcpServers.env`
 works the same way):
