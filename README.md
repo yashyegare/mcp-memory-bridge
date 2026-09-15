@@ -66,22 +66,73 @@ renamed to `MCPServer` (`from mcp.server.mcpserver import MCPServer`). Most
 tutorials online still show the 1.x `FastMCP` import, which raises a
 `ModuleNotFoundError` on 2.x.
 
-## Phase 3 — concurrency harness (ready)
+## Phase 3 — two clients, one server (done: we broke it on purpose)
+
+**Configuration** (per client, via env — Claude Desktop's `mcpServers.env`
+works the same way):
+
+- `MCP_MEMORY_DB` / db argv — which SQLite file to share
+- `MCP_CLIENT_ID` — attribution for this client's writes and log entries
+- `MCP_SQLITE_BUSY_TIMEOUT` — ms a write waits for the lock (default 5000;
+  `0` = fail fast, for experiments)
+- `MCP_ENABLE_DEMO_TOOLS=1` — adds `lock_hold(seconds)`, a demo tool that
+  grabs the write lock and holds it, to make contention deterministic
+
+**The deterministic break** — client A holds the lock while client B writes:
 
 ```bash
-venv\Scripts\python.exe tools\stress_concurrent.py --clients 2 --writes 40
+venv\Scripts\python.exe tools\lock_demo.py          # busy_timeout=0: break
+venv\Scripts\python.exe tools\lock_demo.py --queue  # busy_timeout=5000: heal
 ```
 
-Spawns independent clients, each with its own server subprocess sharing one
-SQLite file, hammering the same key. Every write is verified by an immediate
-read; the report shows how often another client's write won and whether any
-transport/protocol errors occurred. Inspect the full audit trail with the
-command the harness prints at the end.
+Observed output:
 
-To add Claude Desktop as a second client, register the server in
-`claude_desktop_config.json` with the **absolute** path to
-`venv\Scripts\python.exe` and `server\memory_server.py` (relative paths and
-PATH-`python` are the classic failure mode there).
+- **busy_timeout=0:** B's write is **rejected in 0.02s** with a tool-level
+  error whose message survives to the client: `database is locked
+  (busy_timeout=0ms) ... retry with backoff`. The audit trail shows B's
+  write never landed. This is fail-fast rejection — the "other" conflict
+  policy, switchable with one env var.
+- **busy_timeout=5000:** B's write **waits 2.41s**, then commits with full
+  attribution (`source: client-B`). Queuing, not erroring — the production
+  behavior behind the last-write-wins policy.
+
+**Massive contention:** `MCP_SQLITE_BUSY_TIMEOUT=0 venv\Scripts\python.exe
+tools\stress_concurrent.py --clients 4 --writes 50` — 400 operations, 131
+reads observed another client's write win, 29 transport-level errors, and
+one client wedged mid-run: 13 consecutive read timeouts after its server
+stopped responding entirely.
+
+**The wedge is its own lesson — not SQLite's fault.** The wedged server had
+its stderr connected to an *undrained pipe*. mcp 2.x logs every tool error
+to stderr; ~64KB of log later (a few hundred errors at busy_timeout=0), the
+OS pipe buffer fills and the server **blocks on its next stderr write
+forever**. Every subsequent call from that client times out; the server
+cannot recover. Real MCP hosts (Claude Desktop included) drain stderr
+continuously into a log file — which is exactly why this failure almost
+never shows up in polished tooling, and exactly why it's worth having seen
+once. Your hand-rolled client offers `capture_stderr=False` (drain to
+devnull) for stress runs; drain or consume stderr in anything long-lived.
+
+**Adding Claude Desktop as the second client** (already wired in this
+checkout): `claude_desktop_config.json` gets
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "C:\\...\\venv\\Scripts\\python.exe",
+      "args": ["C:\\...\\server\\memory_server.py", "C:\\...\\memory.db"],
+      "env": { "MCP_CLIENT_ID": "claude-desktop", "MCP_SQLITE_BUSY_TIMEOUT": "5000" }
+    }
+  }
+}
+```
+
+Absolute paths are non-negotiable on Windows: relative paths and bare
+`python` resolve differently inside Desktop's environment. After a Desktop
+restart, the connector UI shows `memory_get/set/list/delete`; ask it to
+`memory_set` a key, then watch the attribution and ordering land in your
+raw client's `memory_get(key, include_events=True)`.
 
 ## Tests
 
@@ -117,6 +168,14 @@ time out, not hang.
   HTTP transport would change that); values are plain TEXT (no sizes/typing);
   `memory_list`'s prefix match escapes `%`/`_` but remains a plain LIKE scan
   (fine at this scale).
+- **What broke in Phase 3, precisely.** With `busy_timeout=0`, contention
+  turns into immediate, legible tool-level rejections (the fail-fast policy
+  you'd pick if overwrites were unacceptable); with the default 5s, the same
+  contention queues and resolves via last-write-wins. The genuinely
+  unexpected breakage was operational, not protocol: an undrained stderr
+  pipe lets a server's own error logging wedge it permanently under
+  sustained errors. Fix: drain stderr (as real MCP hosts do); the client
+  exposes `capture_stderr=False` for stress work.
 
 ## Debugging tips
 
