@@ -22,9 +22,13 @@ def _text(result: dict) -> str:
 def _memory_client(make_client, tmp_path, extra_env=None):
     # Default to embeddings OFF (fast, no model load); a test that explicitly
     # passes MCP_EMBEDDINGS in extra_env opts in — extra_env wins.
+    # default_timeout=120: when embeddings are on, the first embedded call
+    # pays the model load, which can stretch past a minute on a loaded
+    # machine (measured 9s idle, >45s under parallel load).
     client = make_client(
         [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
         env={"MCP_EMBEDDINGS": "off", **(extra_env or {})},
+        default_timeout=120.0,
     )
     client.initialize()
     return client

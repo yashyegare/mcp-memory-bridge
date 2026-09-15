@@ -22,8 +22,12 @@ overwrite is always detectable and attributable after the fact (see
 Writes are attributed: every fact row carries source_client, and every
 mutation appends to `events`. `busy_timeout` is set high (5s) so
 near-simultaneous writers from different clients queue rather than
-fail with "database is locked"; WAL mode lets readers proceed while a
-write transaction is open.
+fail with "database is locked". WAL mode matters ACROSS server
+processes (one per MCP client): readers there never block on another
+process's write transaction. Within one process the server-wide lock
+(see _SERVER_LOCK) serializes all tool calls anyway -- WAL is not
+buying in-process reader/writer concurrency, and the README says so
+explicitly.
 
 Run it (usually via your client, not directly):
     venv\\Scripts\\python.exe server/memory_server.py [path/to/memory.db]
@@ -31,6 +35,7 @@ Run it (usually via your client, not directly):
 
 import functools
 import os
+from pathlib import Path
 import sqlite3
 import sys
 import threading
@@ -128,25 +133,57 @@ def _db() -> sqlite3.Connection:
 # With the cache warm, first embed is a few seconds and subsequent ones
 # are milliseconds -- never per-call loading, per the design note.
 _model = None
+_model_lock = threading.Lock()  # lazy load must be single-flight (preload thread vs first call)
+
+
+def _hf_model_cached(model_id: str) -> bool:
+    """Is model_id already in the local HF cache? Pure filesystem check.
+
+    Deliberately does NOT import huggingface_hub: that library (and
+    transformers) snapshot HF_HUB_OFFLINE from the environment at import
+    time, so setting the variable after any HF-family import silently does
+    nothing -- which is exactly the trap this check originally fell into
+    (the env was set, but only after the import, so the model load went
+    online anyway and hung on network freshness checks).
+    """
+    home = Path.home() / ".cache" / "huggingface"
+    hub = Path(os.environ.get("HF_HUB_CACHE",
+               Path(os.environ.get("HF_HOME", home)) / "hub"))
+    snapshots = hub / ("models--" + model_id.replace("/", "--")) / "snapshots"
+    try:
+        return snapshots.is_dir() and any(snapshots.iterdir())
+    except OSError:
+        return False
 
 
 def _embed(texts: list[str]):
     """Embed texts as normalized float32 numpy vectors (cosine-ready)."""
     global _model
     if _model is None:
-        if not EMBEDDINGS_ENABLED:
-            raise ToolError(
-                "semantic search is disabled on this server (MCP_EMBEDDINGS=off); "
-                "use memory_list with a key prefix instead"
-            )
-        # Offline mode unless overridden: the model is cached after the first
-        # run, and letting HF Hub do a network freshness check on load risks
-        # hanging the first tool call on a flaky network (observed here).
-        os.environ.setdefault("HF_HUB_OFFLINE", "1")
-        from sentence_transformers import SentenceTransformer  # deferred heavy import
+        with _model_lock:
+            if _model is None:  # double-checked: only one thread ever loads
+                if not EMBEDDINGS_ENABLED:
+                    raise ToolError(
+                        "semantic search is disabled on this server (MCP_EMBEDDINGS=off); "
+                        "use memory_list with a key prefix instead"
+                    )
+                # Offline-vs-online decided BEFORE any HF import (see
+                # _hf_model_cached): cached -> force offline so network
+                # freshness checks can never hang a tool call (observed);
+                # not cached -> stay online so the one-time download works
+                # (fresh clones, CI).
+                if _hf_model_cached("sentence-transformers/all-MiniLM-L6-v2"):
+                    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+                    print("model cache detected: HF_HUB_OFFLINE=1", file=sys.stderr)
+                from sentence_transformers import SentenceTransformer  # deferred heavy import
 
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-    vectors = _model.encode(texts, normalize_embeddings=True)
+                _model = SentenceTransformer("all-MiniLM-L6-v2")
+    # show_progress_bar=False: ST's default tqdm bar writes to stderr on
+    # every encode. Harmless in a terminal, but a real host captures stderr
+    # through a pipe -- enough per-call refreshes fill the OS pipe buffer
+    # (~64KB) and BLOCK the server mid-encode (the Phase 3 wedge, caused
+    # this time by the embedding path itself).
+    vectors = _model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
     return vectors.astype("float32")
 
 
@@ -279,10 +316,15 @@ def memory_get(key: str, include_events: bool = False) -> str:
 @_tool_guard
 def memory_list(prefix: str = "") -> str:
     """List facts whose key starts with `prefix` (all facts if empty)."""
+    # Escape LIKE wildcards in the prefix, and tell SQLite which escape
+    # character we used: without ESCAPE '\', "\%" is just backslash-percent
+    # (a literal backslash followed by a wildcard), so a prefix containing
+    # % or _ would silently match more than the caller asked for.
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     rows = _db().execute(
         "SELECT key, value, source_client, updated_at FROM facts "
-        "WHERE key LIKE ? ORDER BY key",
-        (prefix.replace("%", r"\%").replace("_", r"\_") + "%",),
+        "WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
+        (escaped + "%",),
     ).fetchall()
     if not rows:
         return f"(no facts matching prefix {prefix!r})"

@@ -49,6 +49,23 @@ def test_list_by_prefix(make_client, tmp_path):
     assert "a/one" in listed and "a/two" in listed and "b/three" not in listed
 
 
+def test_list_prefix_escapes_like_wildcards(make_client, tmp_path):
+    """Regression: a prefix containing % or _ must match LITERALLY.
+    SQLite's LIKE has no default escape character, so the server's backslash
+    escaping does nothing without an ESCAPE clause -- 50%_off used to match
+    '50xooff', '50Xooff', etc. (and 5% alone matched nearly everything)."""
+    client = _memory_client(make_client, tmp_path)
+    for key in ("50%_off", "50xoff", "50%foo", "other-key"):
+        client.call_tool("memory_set", {"key": key, "value": "v"})
+
+    listed = _text(client.call_tool("memory_list", {"prefix": "50%_"}))
+    assert "50%_off" in listed
+    assert "50xoff" not in listed and "50%foo" not in listed and "other-key" not in listed
+
+    listed_all = _text(client.call_tool("memory_list", {"prefix": ""}))
+    assert "50%_off" in listed_all and "other-key" in listed_all  # empty prefix unaffected
+
+
 def test_delete_then_get_fails(make_client, tmp_path):
     client = _memory_client(make_client, tmp_path)
     client.call_tool("memory_set", {"key": "x", "value": "1"})

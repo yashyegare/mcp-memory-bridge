@@ -28,6 +28,7 @@ Reference: https://modelcontextprotocol.io/specification
   (Lifecycle section for the handshake, Tools section for the other two)
 """
 
+import collections
 import json
 import itertools
 import os
@@ -69,10 +70,12 @@ class RawMCPClient:
             server_command,
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            # capture_stderr=False => DEVNULL. Diagnostic option: an undrained
-            # stderr PIPE can fill its OS buffer and BLOCK the server the
-            # moment it logs more than ~64KB (e.g. a tool erroring on every
-            # call). Real hosts drain stderr continuously; see README.
+            # stderr=PIPE gets drained continuously by a dedicated thread
+            # (see _stderr_tail below) -- the Phase 3 lesson: an undrained
+            # stderr PIPE fills its ~64KB OS buffer and BLOCKS the server
+            # the moment it logs more than that (a tool erroring on every
+            # call, or tqdm progress bars). capture_stderr=False => DEVNULL
+            # for stress runs that want zero copy overhead at all.
             stderr=subprocess.PIPE if capture_stderr else subprocess.DEVNULL,
             text=True,
             bufsize=1,  # line-buffered
@@ -86,6 +89,15 @@ class RawMCPClient:
         self._notifications: list[dict] = []
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
+        # Real hosts drain the server's stderr continuously. Capturing
+        # stderr without draining is exactly how the Phase 3 wedge happens:
+        # once ~64KB of un-read output fills the OS pipe buffer, the server
+        # blocks on its next log write and every call times out. Keep a
+        # bounded tail (post-mortem value in close()/error paths) without
+        # unbounded memory or a blocked server.
+        self._stderr_tail: collections.deque[str] = collections.deque(maxlen=50)
+        if self.proc.stderr is not None:
+            threading.Thread(target=self._drain_stderr, daemon=True).start()
 
     # ------------------------------------------------------------------ #
     # Plumbing                                                           #
@@ -103,12 +115,23 @@ class RawMCPClient:
         except (BrokenPipeError, OSError) as exc:
             raise ConnectionError(f"Server stdin closed: {exc}\nStderr: {self._read_stderr()}") from exc
 
+    def _drain_stderr(self) -> None:
+        """Drain the server's stderr forever so it can never block on a log
+        write; retain the most recent lines for post-mortems."""
+        try:
+            for line in self.proc.stderr:
+                self._stderr_tail.append(line.rstrip())
+        except (OSError, ValueError):
+            pass  # stderr closed during teardown
+
     def _read_stderr(self) -> str:
-        """Best-effort stderr snapshot. Only safe to read fully after the
-        process has exited; while it's alive we'd risk blocking."""
-        if self.proc.poll() is not None and self.proc.stderr:
-            return self.proc.stderr.read()
-        return "<server still running; check its logs>"
+        """Recent stderr output (continuously drained, so this never blocks
+        and is safe to call at any time, process alive or dead)."""
+        if self.proc.stderr is None:
+            return "<stderr not captured>"
+        if self._stderr_tail:
+            return "\n".join(self._stderr_tail)
+        return "(stderr empty)"
 
     def _read_loop(self) -> None:
         """Reader thread: push every stdout line onto the queue; push None on EOF."""
