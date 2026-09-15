@@ -1,5 +1,7 @@
 # mcp-scratch-client
 
+[![tests](https://github.com/yashyegare/mcp-memory-bridge/actions/workflows/tests.yml/badge.svg)](https://github.com/yashyegare/mcp-memory-bridge/actions/workflows/tests.yml)
+
 A from-scratch MCP client (raw JSON-RPC 2.0 over stdio, no SDK) + a shared
 SQLite-backed memory MCP server, built as a learning project. The goal is to
 understand the protocol and its concurrency behavior by hand, not by leaning
@@ -9,10 +11,11 @@ on libraries that hide the interesting parts.
 
 ```bash
 python -m venv venv
-venv\Scripts\pip install mcp pytest
-# optional, for Phase 4A semantic recall (downloads the ~80MB model on first use):
-venv\Scripts\pip install sentence-transformers
+venv\Scripts\pip install -r requirements.txt   # pinned; includes sentence-transformers (Phase 4A)
 ```
+
+Semantic recall is optional at runtime: `MCP_EMBEDDINGS=off` runs the server
+without the ML stack entirely.
 
 All commands below use `venv\Scripts\python.exe` explicitly — bare `python`
 on PATH may be a different interpreter without the dependencies installed.
@@ -155,8 +158,10 @@ forever**. Every subsequent call from that client times out; the server
 cannot recover. Real MCP hosts (Claude Desktop included) drain stderr
 continuously into a log file — which is exactly why this failure almost
 never shows up in polished tooling, and exactly why it's worth having seen
-once. Your hand-rolled client offers `capture_stderr=False` (drain to
-devnull) for stress runs; drain or consume stderr in anything long-lived.
+once. The hand-rolled client now **drains stderr continuously on a
+daemon thread** (keeping a bounded tail for post-mortems) — the same thing
+real hosts do. `capture_stderr=False` (straight to devnull) remains
+available for stress runs as a zero-copy option.
 
 **Adding Claude Desktop as the second client** (already wired in this
 checkout): `claude_desktop_config.json` gets
@@ -193,13 +198,17 @@ query: "appearance preference for screens"  (those words appear in NO stored fac
   pet/name  = Fluffy is a tabby cat                  (cosine 0.036)
 ```
 
-Design notes: the model loads **lazily** on first use (per-process singleton)
-— loading at startup would tax every client spawn, since each MCP client
-runs its own server subprocess. `HF_HUB_OFFLINE=1` is forced once the model
-is cached, so a flaky network can never hang a tool call. Set
-`MCP_EMBEDDINGS=off` for a lean server with no ML dependencies; set
-`MCP_PRELOAD_MODEL=1` if your host prefers paying the load at spawn instead
-of on first call. Every search is audit-logged (query, winner, score).
+Design notes: the model loads **lazily** on first use (per-process singleton,
+single-flight under the `_model_lock`) — loading at startup would tax every
+client spawn, since each MCP client runs its own server subprocess. Once the
+model is in the local HF cache, the server forces `HF_HUB_OFFLINE=1`, so a
+flaky network can never hang a tool call; on a fresh machine it allows the
+one-time download instead. Set `MCP_EMBEDDINGS=off` for a lean server with
+no ML dependencies; set `MCP_PRELOAD_MODEL=1` if your host prefers paying
+the load at spawn instead of on first call. Every search is audit-logged
+(query, winner, score). The latency claims are enforced, not aspirational:
+`tests\test_perf_benchmarks.py` asserts warm `memory_set` < 100ms and warm
+`memory_search` < 50ms (medians over a ~200-fact store; CI gets 4× headroom).
 
 Phase 4B rode along nearly free (the events table already existed):
 `memory_history(key, include_reads)` exposes per-key attribution history as
@@ -233,11 +242,21 @@ time out, not hang.
   row-level busy handling, and WAL mode to reason about. A JSON file has
   none; a graph DB adds a server process and query language this project
   doesn't need.
-- **WAL mode + busy_timeout (5s), last-write-wins.** WAL lets readers
-  proceed during writes; `busy_timeout` makes near-simultaneous writers
-  queue instead of failing with `database is locked`. With writers already
-  serialized by the lock, an explicit conflict check would add friction
-  without adding information — so we don't reject concurrent writes.
+- **WAL mode + busy_timeout (5s), last-write-wins — and what WAL does *not*
+  buy here.** `busy_timeout` makes near-simultaneous writers queue instead
+  of failing with `database is locked`; with writers already serialized, an
+  explicit conflict check would add friction without adding information, so
+  we don't reject concurrent writes. But an honest caveat: each MCP client
+  spawns its own server subprocess, so the concurrency that matters is
+  *across* processes — and there WAL genuinely lets a reader proceed during
+  another process's open write transaction (the `inspect_memory.py` CLI
+  reading while a hammer writes is exactly this). *Within* one process,
+  `_SERVER_LOCK` deliberately serializes every tool call, reads included,
+  so WAL's reader/writer parallelism never applies in-process. That's a
+  conscious trade, not an oversight: one shared connection plus a coarse
+  lock is dramatically simpler and always correct; a connection pool or
+  read/write lock split would buy concurrency this workload doesn't need.
+  Claiming WAL for in-process reads would be overclaiming.
 - **Attribution + audit trail instead of conflict rejection.** Every fact
   carries `source_client`; every mutation lands in `events`. An overwrite is
   therefore always detectable and attributable after the fact (`memory_get`
@@ -266,8 +285,17 @@ time out, not hang.
   contention queues and resolves via last-write-wins. The genuinely
   unexpected breakage was operational, not protocol: an undrained stderr
   pipe lets a server's own error logging wedge it permanently under
-  sustained errors. Fix: drain stderr (as real MCP hosts do); the client
-  exposes `capture_stderr=False` for stress work.
+  sustained errors. Fix: drain stderr (as real MCP hosts do), which the
+  client now does by default. This failure mode came back a *second*
+  time from a different direction: sentence-transformers' tqdm progress
+  bars write to stderr on every `encode()` call, and ~200 warm-up writes
+  filled the pipe buffer with progress-bar refreshes — wedging a server
+  whose stderr was captured but not drained. Same lesson, second cause:
+  the server now passes `show_progress_bar=False`, and the client drains.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 ## Debugging tips
 

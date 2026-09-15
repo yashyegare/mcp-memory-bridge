@@ -1,0 +1,11 @@
+mcp==2.2.0
+numpy==2.5.3
+sentence-transformers==6.0.1
+pytest==9.1.1
+
+# Notes:
+# - Developed and tested on Python 3.13 (Windows).
+# - sentence-transformers is optional at runtime (MCP_EMBEDDINGS=off runs
+#   the server without it) but required for the Phase 4 semantic tests.
+# - The all-MiniLM-L6-v2 model (~80MB) downloads to the local HF cache on
+#   first use; after that the server forces offline mode automatically.
