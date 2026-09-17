@@ -229,6 +229,8 @@ the client must time out, not hang. Non-semantic tests run with
 - **Known trade-offs.** One server per client means no cross-machine sharing
   (the HTTP/SSE transport option would change that); values are plain TEXT;
   `memory_list` is a prefix `LIKE` scan (fine at this scale).
+- **Concurrency Control (CAS & Create-Only):**  
+  To safely handle multiple agents interacting with the same memory instance, we rely on optimistic concurrency control. Clients can use Compare-And-Swap (CAS) by passing an `expected_value` with their write requests; the update only succeeds if the underlying data hasn't been altered by another process in the meantime. Alternatively, clients can pass a `require_absent` flag to enforce create-only semantics, ensuring a key is safely initialized without overwriting existing data. Both mechanisms prevent race conditions and lost updates without the need for complex external locking.
 
 ## Debugging tips
 

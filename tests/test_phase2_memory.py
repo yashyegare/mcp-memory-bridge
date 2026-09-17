@@ -34,6 +34,71 @@ def test_set_get_round_trip(make_client, tmp_path):
     assert "source: test" in _text(result)
 
 
+def test_cas_succeeds_when_expected_matches(make_client, tmp_path):
+    client = _memory_client(make_client, tmp_path)
+    client.call_tool("memory_set", {"key": "k", "value": "v1", "client_id": "a"})
+    result = client.call_tool(
+        "memory_set", {"key": "k", "value": "v2", "client_id": "a", "expected_value": "v1"}
+    )
+    assert result.get("isError") is not True
+    assert "v2" in _text(client.call_tool("memory_get", {"key": "k"}))
+
+
+def test_cas_rejects_when_expected_does_not_match(make_client, tmp_path):
+    client = _memory_client(make_client, tmp_path)
+    client.call_tool("memory_set", {"key": "k", "value": "real", "client_id": "a"})
+    result = client.call_tool(
+        "memory_set",
+        {"key": "k", "value": "hijack", "client_id": "b", "expected_value": "stale-guess"},
+    )
+    assert result.get("isError") is True
+    assert "CAS failed" in _text(result)
+    assert "stale-guess" in _text(result) and "real" in _text(result)
+    # The rejected write must not have landed.
+    assert "real" in _text(client.call_tool("memory_get", {"key": "k"}))
+
+
+def test_cas_failure_is_logged_and_visible_in_history(make_client, tmp_path):
+    client = _memory_client(make_client, tmp_path)
+    client.call_tool("memory_set", {"key": "k", "value": "real", "client_id": "a"})
+    client.call_tool(
+        "memory_set",
+        {"key": "k", "value": "hijack", "client_id": "b", "expected_value": "stale-guess"},
+    )
+    history = _text(client.call_tool("memory_history", {"key": "k"}))
+    assert "cas_fail" in history and "b" in history
+
+
+def test_require_absent_succeeds_on_new_key(make_client, tmp_path):
+    client = _memory_client(make_client, tmp_path)
+    result = client.call_tool(
+        "memory_set", {"key": "new-key", "value": "v1", "client_id": "a", "require_absent": True}
+    )
+    assert result.get("isError") is not True
+    assert "v1" in _text(client.call_tool("memory_get", {"key": "new-key"}))
+
+
+def test_require_absent_rejects_existing_key(make_client, tmp_path):
+    client = _memory_client(make_client, tmp_path)
+    client.call_tool("memory_set", {"key": "k", "value": "original", "client_id": "a"})
+    result = client.call_tool(
+        "memory_set", {"key": "k", "value": "overwrite", "client_id": "b", "require_absent": True}
+    )
+    assert result.get("isError") is True
+    assert "already exists" in _text(result)
+    assert "original" in _text(client.call_tool("memory_get", {"key": "k"}))
+
+
+def test_expected_value_and_require_absent_are_mutually_exclusive(make_client, tmp_path):
+    client = _memory_client(make_client, tmp_path)
+    result = client.call_tool(
+        "memory_set",
+        {"key": "k", "value": "v", "expected_value": "x", "require_absent": True},
+    )
+    assert result.get("isError") is True
+    assert "mutually exclusive" in _text(result)
+
+
 def test_get_missing_key_is_tool_level_error(make_client, tmp_path):
     client = _memory_client(make_client, tmp_path)
     result = client.call_tool("memory_get", {"key": "nope"})

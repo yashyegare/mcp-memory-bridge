@@ -50,7 +50,7 @@ def key_history(db: sqlite3.Connection, key: str) -> None:
     print()
     rows = db.execute(
         "SELECT timestamp, client_id, action, value FROM events "
-        "WHERE key = ? AND action IN ('set', 'delete', 'search') ORDER BY id",
+        "WHERE key = ? AND action IN ('set', 'delete', 'search', 'cas_fail') ORDER BY id",
         (key,),
     ).fetchall()
     if not rows:

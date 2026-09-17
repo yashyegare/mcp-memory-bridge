@@ -15,9 +15,16 @@ overwrite is always detectable and attributable after the fact (see
   decides the winner. Rejecting at that point adds friction without
   adding information.
 - What callers actually need to debug a shared store is attribution and
-  history, not early rejection. The events table provides both; if a
-  use case later needs optimistic concurrency, compare-and-swap
-  (memory_set with expected_value) is the natural extension.
+  history, not early rejection by default. The events table provides
+  both, and callers who DO want to reject on conflict opt in per-call:
+  `memory_set(..., expected_value=...)` performs compare-and-swap, and
+  `memory_set(..., require_absent=True)` is create-only. Both are a
+  single atomic SQL statement (conditional UPDATE / bare INSERT relying
+  on the PK conflict), not a Python-level read-then-write -- a
+  read-then-write would race exactly the way _SERVER_LOCK exists to
+  prevent, just one layer up. A failed CAS attempt is still logged
+  (action='cas_fail', see memory_history) so "who tried to overwrite
+  this and lost" is as debuggable as an accepted write.
 
 Writes are attributed: every fact row carries source_client, and every
 mutation appends to `events`. `busy_timeout` is set high (5s) so
@@ -255,36 +262,108 @@ def _tool_guard(fn):
 
 
 @_tool_guard
-def _guarded_set(key: str, value: str, client_id: str | None = None) -> str:
+def _guarded_set(
+    key: str,
+    value: str,
+    client_id: str | None = None,
+    expected_value: str | None = None,
+    require_absent: bool = False,
+) -> str:
     cid = client_id or DEFAULT_CLIENT_ID
+    if require_absent and expected_value is not None:
+        raise ToolError("require_absent and expected_value are mutually exclusive")
     db = _db()
     # Embed BEFORE opening the write transaction: the first call loads the
     # model (~seconds) and must not hold SQLite's write lock while doing it.
     embedding = _embed([f"{key}: {value}"])[0].tobytes() if EMBEDDINGS_ENABLED else None
+
+    cas_failure: str | None = None
     with db:  # transaction: fact update + event insert (+ embedding) commit together
-        db.execute(
-            "INSERT INTO facts (key, value, source_client, updated_at) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
-            "source_client=excluded.source_client, updated_at=excluded.updated_at",
-            (key, value, cid, _now()),
-        )
-        if embedding is not None:
-            db.execute(
-                "INSERT INTO fact_embeddings (key, embedding) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET embedding=excluded.embedding",
-                (key, embedding),
+        if require_absent:
+            # Atomic create-only: the PK conflict IS the failure signal.
+            # A "check it doesn't exist, then INSERT" would race under
+            # concurrent writers -- this can't, since it's one statement.
+            try:
+                db.execute(
+                    "INSERT INTO facts (key, value, source_client, updated_at) VALUES (?, ?, ?, ?)",
+                    (key, value, cid, _now()),
+                )
+            except sqlite3.IntegrityError:
+                current = db.execute("SELECT value FROM facts WHERE key = ?", (key,)).fetchone()
+                cas_failure = f"key already exists (current value: {current['value'] if current else '<unknown>'})"
+        elif expected_value is not None:
+            # Compare-and-swap as ONE conditional UPDATE: the match check
+            # and the write happen in the same statement, so there's no
+            # window between "read current value" and "write new value"
+            # for another writer to land in. A Python-level read-then-
+            # write here would reintroduce the exact race _SERVER_LOCK
+            # exists to prevent, one layer up, and only within this
+            # process -- it wouldn't protect against another server
+            # process (another MCP client) writing between the two steps.
+            cur = db.execute(
+                "UPDATE facts SET value=?, source_client=?, updated_at=? "
+                "WHERE key=? AND value=?",
+                (value, cid, _now(), key, expected_value),
             )
-        _log(cid, "set", key, value)
+            if cur.rowcount == 0:
+                current = db.execute("SELECT value FROM facts WHERE key = ?", (key,)).fetchone()
+                actual = current["value"] if current else None
+                cas_failure = f"expected {expected_value!r}, actual is {actual!r}"
+        else:
+            db.execute(
+                "INSERT INTO facts (key, value, source_client, updated_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
+                "source_client=excluded.source_client, updated_at=excluded.updated_at",
+                (key, value, cid, _now()),
+            )
+
+        if cas_failure is None:
+            if embedding is not None:
+                db.execute(
+                    "INSERT INTO fact_embeddings (key, embedding) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET embedding=excluded.embedding",
+                    (key, embedding),
+                )
+            _log(cid, "set", key, value)
+        # else: nothing was mutated (the failed INSERT raised and was
+        # caught; the failed UPDATE's rowcount==0 means no row changed),
+        # so this transaction commits as a no-op -- there's nothing to
+        # roll back.
+
+    if cas_failure is not None:
+        # Logged in its OWN transaction, after the attempt's transaction
+        # above already closed: a cas_fail event must survive even though
+        # the attempted write didn't, so it can't share that transaction.
+        _log(cid, "cas_fail", key, cas_failure)
+        db.commit()
+        raise ToolError(f"CAS failed for {key!r}: {cas_failure}")
     return f"set {key!r} (from {cid})"
 
 
 @mcp.tool()
 @_tool_guard
-def memory_set(key: str, value: str, client_id: str | None = None) -> str:
-    """Store a fact (last-write-wins). Overwrites any existing value for
-    `key`; the write is attributed to `client_id` (defaults to this
-    server's MCP_CLIENT_ID env setting) and logged to events."""
-    return _guarded_set(key, value, client_id)
+def memory_set(
+    key: str,
+    value: str,
+    client_id: str | None = None,
+    expected_value: str | None = None,
+    require_absent: bool = False,
+) -> str:
+    """Store a fact. Default is last-write-wins (unconditional overwrite).
+
+    For optimistic concurrency, pass expected_value: the write only
+    commits if the key's CURRENT value equals expected_value exactly
+    (compare-and-swap) -- otherwise it's rejected with the actual current
+    value in the error, so the caller can re-read and retry instead of
+    silently clobbering someone else's write.
+
+    Pass require_absent=True instead to only succeed if the key does not
+    exist yet (create-only). Mutually exclusive with expected_value.
+
+    Every attempt is logged -- successful writes as 'set', failed CAS/
+    create-only attempts as 'cas_fail' -- so see memory_history to debug
+    who tried to write what, and who lost."""
+    return _guarded_set(key, value, client_id, expected_value, require_absent)
 
 
 @mcp.tool()
@@ -303,7 +382,7 @@ def memory_get(key: str, include_events: bool = False) -> str:
     if include_events:
         rows = _db().execute(
             "SELECT timestamp, client_id, action, value FROM events "
-            "WHERE key = ? AND action IN ('set', 'delete') ORDER BY id",
+            "WHERE key = ? AND action IN ('set', 'delete', 'cas_fail') ORDER BY id",
             (key,),
         ).fetchall()
         out += "\nevents:\n" + "\n".join(
@@ -369,10 +448,15 @@ def memory_search(query: str, top_k: int = 3) -> str:
 @mcp.tool()
 @_tool_guard
 def memory_history(key: str, include_reads: bool = False) -> str:
-    """Full audit trail for one key: every set/delete event in order, with
-    attribution -- who wrote what, when. include_reads=True also shows
-    every get and every semantic-search hit on this key (verbose)."""
-    actions = "('set', 'get', 'delete', 'search')" if include_reads else "('set', 'delete')"
+    """Full audit trail for one key: every set/delete/cas_fail event in
+    order, with attribution -- who wrote what (and who tried and lost a
+    CAS/create-only race), when. include_reads=True also shows every get
+    and every semantic-search hit on this key (verbose)."""
+    actions = (
+        "('set', 'get', 'delete', 'search', 'cas_fail')"
+        if include_reads
+        else "('set', 'delete', 'cas_fail')"
+    )
     rows = _db().execute(
         f"SELECT timestamp, client_id, action, value FROM events "
         f"WHERE key = ? AND action IN {actions} ORDER BY id",
