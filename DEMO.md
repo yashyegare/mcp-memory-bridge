@@ -68,6 +68,6 @@ Wait for the FAIL line.
 venv\Scripts\python.exe -m pytest tests\ --tb=no -q
 ```
 
-> "27 integration tests, real subprocesses, real wire protocol. Lint and a
+> "37 integration tests, real subprocesses, real wire protocol. Lint and a
 > three-Python-version matrix run on every push, and the lean server
 > ships as a Docker image."

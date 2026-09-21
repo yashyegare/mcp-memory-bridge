@@ -32,6 +32,10 @@ JSON-RPC 2.0 over stdio, no SDK) used to exercise it.
 Built to understand the protocol and its concurrency behavior by hand, not
 through libraries that hide the interesting parts.
 
+Phase 4C adds an HTTP mode where one long-running server hosts many remote
+clients over the network (bearer-token gated) — see below and
+[docs/AUTH.md](docs/AUTH.md) for the trust model.
+
 ## Results at a glance
 
 | Experiment | Outcome |
@@ -69,7 +73,7 @@ CI builds the image and smoke-tests the handshake through it on every push.
 
 ```
 client/
-  raw_client.py        # hand-rolled MCP client: handshake, tools/list, tools/call
+  raw_client.py        # hand-rolled MCP clients: stdio + HTTP, handshake, tools/*
 server/
   test_server.py       # trivial SDK server (echo, add) — Phase 1 target
   memory_server.py     # SQLite-backed shared memory server — Phases 2/3/4
@@ -80,6 +84,7 @@ tools/
   inspect_memory.py    # pretty-print the store / history / search log
 tests/                 # integration tests: real subprocesses, real wire protocol
 docs/NOTES.md          # the debugging stories: what broke and why
+docs/AUTH.md           # HTTP transport: auth scheme and its honest limits
 ```
 
 ## How it's built
@@ -175,6 +180,32 @@ venv\Scripts\python.exe tools\inspect_memory.py --key live/color  # one key's hi
 venv\Scripts\python.exe tools\inspect_memory.py --searches        # search log
 ```
 
+### Phase 4C — HTTP transport + auth
+
+stdio gives every client its own server subprocess. `MCP_TRANSPORT=http`
+flips the server to **streamable-HTTP** so one long-running server hosts any
+number of remote clients on the same store — the shape you'd actually
+deploy (and the prerequisite for the planned cloud demo):
+
+```bash
+# server (fail-closed: no token, no start — see docs/AUTH.md)
+MCP_TRANSPORT=http MCP_AUTH_TOKEN=<secret> \
+  venv/Scripts/python.exe server/memory_server.py memory.db
+
+# client — RawHTTPMCPClient, also stdlib-only, no SDK
+venv/Scripts/python.exe -c "import sys; sys.path.insert(0,'client'); from raw_client import RawHTTPMCPClient; c=RawHTTPMCPClient('http://127.0.0.1:8000/mcp', token='<secret>'); c.initialize(); print([t['name'] for t in c.list_tools()]); print(c.call_tool('memory_set',{'key':'net/hello','value':'over http','client_id':'http'}).get('content')[0].get('text')); c.close()"
+```
+
+What the HTTP mode teaches that stdio hides (both sides hand-rolled over
+`urllib`): identity is a *header* (`Mcp-Session-Id` is issued at initialize
+and echoed thereafter), HTTP status codes live a layer below JSON-RPC
+(401 before any `error` object exists), and `json_response=True` turns the
+streamable-HTTP transport's default SSE stream into plain JSON bodies a
+raw client can parse. Auth is one shared bearer token checked in pure-ASGI
+middleware *before* the MCP layer parses anything — and the design doc is
+explicit that the token authenticates the installation, not the user:
+attribution stays trust-based over HTTP too.
+
 ## Configuration
 
 Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
@@ -188,6 +219,9 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 | `MCP_PRELOAD_MODEL` | `1` = load the embedding model at spawn instead of first use |
 | `MCP_LOG_READS` | `off` = `memory_get` becomes truly read-only (see design notes) |
 | `MCP_MAX_KEY_LEN` / `MCP_MAX_VALUE_LEN` | input caps (defaults 256 / 16384 chars) |
+| `MCP_TRANSPORT` | `stdio` (default, one subprocess per client) or `http` |
+| `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | bind address for the HTTP transport (default localhost:8000) |
+| `MCP_AUTH_TOKEN` | bearer token; **required** when `MCP_TRANSPORT=http` (server refuses to start without it) |
 | `MCP_ENABLE_DEMO_TOOLS` | `1` = add `lock_hold(seconds)` demo tool for contention demos |
 | `MCP_DEBUG_LOG` | path; server-side forensic record of every tool call |
 
@@ -198,9 +232,10 @@ venv\Scripts\python.exe -m pytest tests\ -v    # Windows
 venv/bin/python -m pytest tests/ -v            # Linux/macOS
 ```
 
-30 integration tests (28 storage/protocol + 2 that load the embedding
+37 integration tests (35 transport/storage + 2 that load the embedding
 model: the semantic lifecycle and the latency benchmark); every test
-spawns a real server subprocess and speaks the real wire protocol —
+spawns a real server — a subprocess over stdio, or a live HTTP server
+exercised with raw `urllib` requests — and speaks the real wire protocol,
 including one where the server hangs silently and the client must time
 out, not hang. Non-semantic tests run with `MCP_EMBEDDINGS=off` so the
 suite doesn't pay the model load per test.
@@ -236,9 +271,11 @@ suite doesn't pay the model load per test.
   table, brute-force cosine in numpy — sub-10 ms at hundreds to low
   thousands of facts, zero extra infrastructure. An ANN index is the
   upgrade path if the store grows, not a day-one need.
-- **Known trade-offs.** One server per client means no cross-machine
-  sharing (the HTTP/SSE transport option would change that); `memory_list`
-  is a prefix `LIKE` scan (fine at this scale).
+- **Known trade-offs.** stdio keeps one server per client (the HTTP
+  transport removes that limit when needed); values are plain TEXT;
+  `memory_list` is a prefix `LIKE` scan (fine at this scale); over HTTP,
+  the token gates *access*, while attribution stays trust-based
+  ([docs/AUTH.md](docs/AUTH.md) draws that line explicitly).
 
 ## Debugging
 
