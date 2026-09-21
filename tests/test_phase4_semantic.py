@@ -8,7 +8,6 @@ import importlib.util
 import sys
 
 import pytest
-
 from conftest import ROOT
 
 MEMORY_SERVER = str(ROOT / "server" / "memory_server.py")

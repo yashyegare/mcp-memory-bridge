@@ -29,8 +29,8 @@ Reference: https://modelcontextprotocol.io/specification
 """
 
 import collections
-import json
 import itertools
+import json
 import os
 import queue
 import subprocess

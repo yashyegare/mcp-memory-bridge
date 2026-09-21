@@ -23,7 +23,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, "client")
-from raw_client import MCPError, RawMCPClient  # noqa: E402
+from raw_client import MCPError, RawMCPClient
 
 DEFAULT_DB = "stress.db"
 PYTHON = sys.executable

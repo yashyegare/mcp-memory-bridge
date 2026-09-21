@@ -1,0 +1,14 @@
+# Lint config. Kept minimal: correctness rules (E4/E7/E9/F) plus import
+# sorting (I) and ruff-specific hygiene (RUF). Formatting is not enforced —
+# the codebase predates the tool and black-style reformatting would bury
+# the git history.
+target-version = "py311"
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F", "I", "RUF", "BLE"]
+
+[lint.per-file-ignores]
+# Preload/model teardown paths catch Exception deliberately: a failed
+# preload must fall back to lazy loading, not crash the server process.
+"server/memory_server.py" = ["BLE"]

@@ -3,7 +3,6 @@
 import sys
 
 import pytest
-
 from conftest import ROOT
 from raw_client import MCPError, RawMCPClient
 

@@ -9,7 +9,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "client"))  # so `from raw_client import ...` works
 
 import pytest  # noqa: E402
-
 from raw_client import RawMCPClient  # noqa: E402
 
 

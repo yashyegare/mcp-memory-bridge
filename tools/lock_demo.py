@@ -21,7 +21,7 @@ import sys
 import time
 
 sys.path.insert(0, "client")
-from raw_client import MCPError, RawMCPClient  # noqa: E402
+from raw_client import RawMCPClient
 
 
 def _text(result: dict) -> str:
