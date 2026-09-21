@@ -41,6 +41,8 @@ Run it (usually via your client, not directly):
 """
 
 import functools
+import hmac
+import json
 import os
 import sqlite3
 import sys
@@ -73,6 +75,21 @@ MAX_VALUE_LEN = int(os.environ.get("MCP_MAX_VALUE_LEN", "16384"))
 # process holds the write lock, even at busy_timeout=0), at the cost of
 # losing read attribution in the audit trail.
 LOG_READS = os.environ.get("MCP_LOG_READS", "1") != "off"
+# Phase 4C: HTTP transport. stdio stays the default (one server subprocess
+# per client); MCP_TRANSPORT=http serves streamable-HTTP instead, so remote
+# clients can share ONE server (and one store) over the network. See
+# docs/AUTH.md for the trust model behind the token requirement.
+TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
+HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
+AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+# Phase 4C: HTTP transport. stdio stays the default (one server subprocess
+# per client). MCP_TRANSPORT=http serves streamable-HTTP instead so remote
+# clients can share one store -- see docs/AUTH.md for the trust model.
+TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
+HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
+HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
+AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 
 mcp = MCPServer("memory-server")
 
@@ -556,12 +573,69 @@ def _maybe_preload_model() -> None:
     threading.Thread(target=_load, daemon=True).start()
 
 
+def _bearer_auth_asgi(app, token: str):
+    """Wrap the streamable-HTTP ASGI app with a bearer-token check.
+
+    Pure ASGI middleware (no Starlette import needed): rejects unauthenticated
+    requests BEFORE the MCP layer parses a body or touches the db. Response
+    body is a JSON-RPC error object so even protocol-pure clients get an
+    interpretable failure. See docs/AUTH.md for what this does and does not
+    claim. Compares with hmac.compare_digest (timing-attack safe); a missing
+    header must not leak whether a token is even configured.
+    """
+
+    async def _auth_middleware(scope, receive, send):
+        if scope["type"] != "http":
+            await app(scope, receive, send)
+            return
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        supplied = headers.get("authorization", "")
+        expected = f"Bearer {token}"
+        if not (supplied and hmac.compare_digest(supplied, expected)):
+            body = json.dumps({
+                "jsonrpc": "2.0",
+                "id": None,
+                "error": {"code": -32001, "message": "Unauthorized: missing or invalid bearer token"},
+            }).encode("utf-8")
+            await send({"type": "http.response.start", "status": 401,
+                        "headers": [(b"content-type", b"application/json"),
+                                    (b"www-authenticate", b"Bearer"),
+                                    (b"content-length", str(len(body)).encode("ascii"))]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        await app(scope, receive, send)
+
+    return _auth_middleware
+
+
+def _run_http() -> None:
+    """Serve streamable-HTTP with the auth wrapper. Fails closed: no token,
+    no server (docs/AUTH.md). json_response=True returns plain JSON bodies
+    instead of SSE streams, which is what a hand-rolled client wants to
+    parse; DNS-rebinding protection is left ON for the default localhost
+    bind so a browser page cannot silently proxy requests at the server."""
+    if not AUTH_TOKEN:
+        print("refusing to start: MCP_TRANSPORT=http requires MCP_AUTH_TOKEN "
+              "(docs/AUTH.md)", file=sys.stderr)
+        sys.exit(2)
+    import uvicorn  # already an mcp dependency
+
+    app = mcp.streamable_http_app(json_response=True)
+    wrapped = _bearer_auth_asgi(app, AUTH_TOKEN)
+    print(f"http transport: http://{HTTP_HOST}:{HTTP_PORT}/mcp "
+          f"(bearer token required, json mode)", file=sys.stderr)
+    uvicorn.run(wrapped, host=HTTP_HOST, port=HTTP_PORT, log_level="warning")
+
+
 if __name__ == "__main__":
-    # Avoid stray print()s: stdout is the protocol channel.
+    # Avoid stray print()s: stdout is the protocol channel (stdio mode).
     print(
         f"memory server: db={os.path.abspath(DB_PATH)} busy_timeout={BUSY_TIMEOUT_MS}ms "
-        f"client_id={DEFAULT_CLIENT_ID!r}",
+        f"client_id={DEFAULT_CLIENT_ID!r} transport={TRANSPORT}",
         file=sys.stderr,
     )
     _maybe_preload_model()
-    mcp.run(transport="stdio")
+    if TRANSPORT == "http":
+        _run_http()
+    else:
+        mcp.run(transport="stdio")

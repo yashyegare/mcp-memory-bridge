@@ -36,6 +36,8 @@ import queue
 import subprocess
 import sys
 import threading
+import urllib.error
+import urllib.request
 
 
 class MCPError(Exception):
@@ -257,6 +259,124 @@ class RawMCPClient:
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait(timeout=5)
+
+
+class RawHTTPMCPClient:
+    """MCP client over streamable-HTTP, stdlib-only (urllib), no SDK.
+
+    Speaks the same JSON-RPC messages as RawMCPClient but over HTTP POSTs:
+    one JSON body in, one JSON body out (json_response=True server side).
+    Phase 4C lessons the stdio transport hid:
+
+    - identity is a HEADER, not a wire protocol concept: Mcp-Session-Id is
+      issued by the server's initialize response and must be echoed on
+      every later request (that's "which conversation is this?")
+    - HTTP status codes are a layer BELOW JSON-RPC: 401/404/500 happen
+      before any protocol error object exists
+    - the initialized notification is a POST with no id that expects no
+      result -- a notification has no response over HTTP either
+    """
+
+    def __init__(self, url: str, token: str, protocol_version: str = "2025-11-25"):
+        self.url = url.rstrip("/")
+        self.token = token
+        self.protocol_version = protocol_version
+        self.session_id: str | None = None  # issued by the server at initialize
+        self._id_counter = itertools.count(1)
+
+    def _next_id(self) -> int:
+        return next(self._id_counter)
+
+    def _headers(self) -> dict:
+        h = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",  # request plain JSON, not an SSE stream
+        }
+        if self.session_id:
+            h["Mcp-Session-Id"] = self.session_id
+        return h
+
+    def _post(self, message: dict) -> tuple[int, dict | str, dict]:
+        """POST one JSON-RPC message; return (http_status, parsed-or-raw,
+        response-headers-lowercased). Headers matter: initialize carries
+        the Mcp-Session-Id the client must echo from then on."""
+        req = urllib.request.Request(
+            self.url, data=json.dumps(message).encode("utf-8"),
+            headers=self._headers(), method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req) as resp:
+                body = resp.read().decode("utf-8")
+                status = resp.status
+                headers = {k.lower(): v for k, v in resp.getheaders()}
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            status = exc.code
+            headers = {k.lower(): v for k, v in exc.headers.items()} if exc.headers else {}
+        try:
+            return status, json.loads(body), headers
+        except json.JSONDecodeError:
+            return status, body, headers
+
+    def _request(self, method: str, params: dict | None = None) -> dict:
+        request_id = self._next_id()
+        status, resp, _hdrs = self._post({
+            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {},
+        })
+        if not isinstance(resp, dict):
+            raise ConnectionError(f"HTTP {status}: non-JSON response from {self.url}: {resp!r}")
+        # HTTP-level failure: the JSON-RPC error object may not exist yet.
+        if status == 401:
+            raise MCPError(-32001, "unauthorized (401): token missing/invalid", resp.get("error"))
+        if status >= 400:
+            raise ConnectionError(f"HTTP {status} from {self.url}: {str(resp)[:200]}")
+        if "error" in resp:
+            err = resp["error"]
+            raise MCPError(err.get("code"), err.get("message"), err.get("data"))
+        return resp.get("result", {})
+
+    def initialize(self) -> dict:
+        """Handshake over HTTP: initialize (captures the Mcp-Session-Id
+        response header), then the initialized notification (a POST that
+        expects no reply)."""
+        request_id = self._next_id()
+        status, resp, _hdrs = self._post({
+            "jsonrpc": "2.0", "id": request_id, "method": "initialize",
+            "params": {
+                "protocolVersion": self.protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "raw-http-client", "version": "0.1.0"},
+            },
+        })
+        if status != 200 or not isinstance(resp, dict) or "error" in resp:
+            err = resp.get("error") if isinstance(resp, dict) else None
+            raise MCPError(status, f"initialize failed (HTTP {status})", err)
+        session = _hdrs.get("mcp-session-id")
+        if not session:
+            raise ConnectionError("server issued no Mcp-Session-Id at initialize")
+        self.session_id = session
+        self._post({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}})
+        return resp.get("result", {})
+
+    def list_tools(self) -> list[dict]:
+        result = self._request("tools/list")
+        return result.get("tools", [])
+
+    def call_tool(self, name: str, arguments: dict) -> dict:
+        return self._request("tools/call", params={"name": name, "arguments": arguments})
+
+    def close(self) -> None:
+        # DELETE the session per the streamable-HTTP spec; failure is fine
+        # (the server also expires sessions on its own).
+        if self.session_id:
+            req = urllib.request.Request(
+                self.url, method="DELETE", headers=self._headers(),
+            )
+            try:
+                urllib.request.urlopen(req).close()
+            except urllib.error.HTTPError:
+                pass
 
 
 # ---------------------------------------------------------------------- #
