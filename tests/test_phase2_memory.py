@@ -106,6 +106,86 @@ def test_get_missing_key_is_tool_level_error(make_client, tmp_path):
     assert "no fact for key" in _text(result)
 
 
+def test_input_size_caps(make_client, tmp_path):
+    """Keys/values are length-capped: a shared TEXT store with no limits is
+    one memory_set away from a bloated database."""
+    client = _memory_client(make_client, tmp_path)
+    too_long_value = "x" * 16385
+    result = client.call_tool("memory_set", {"key": "ok", "value": too_long_value})
+    assert result.get("isError") is True
+    assert "16384" in _text(result)
+    too_long_key = "k" * 257
+    result = client.call_tool("memory_set", {"key": too_long_key, "value": "v"})
+    assert result.get("isError") is True
+    assert "256" in _text(result)
+    # The rejected writes must not have touched the store.
+    listed = _text(client.call_tool("memory_list", {}))
+    assert "ok" not in listed
+
+
+def test_log_reads_off_makes_get_truly_read_only(make_client, tmp_path):
+    """Default memory_get logs an event (a WRITE: takes the write lock, can
+    queue behind another client). MCP_LOG_READS=off must (a) make get
+    succeed even while another process holds the lock at busy_timeout=0,
+    and (b) leave zero 'get' rows in the events table."""
+    db_path = str(tmp_path / "memory.db")
+    writer = make_client(
+        [sys.executable, MEMORY_SERVER, db_path],
+        env={"MCP_EMBEDDINGS": "off", "MCP_ENABLE_DEMO_TOOLS": "1"},
+    )
+    writer.initialize()
+    writer.call_tool("memory_set", {"key": "r", "value": "v"})
+
+    reader = make_client(
+        [sys.executable, MEMORY_SERVER, db_path],
+        env={"MCP_EMBEDDINGS": "off", "MCP_LOG_READS": "off", "MCP_SQLITE_BUSY_TIMEOUT": "0"},
+    )
+    reader.initialize()
+    # 3s < lock_hold's default 2s + overhead, so the get lands mid-hold.
+    import threading
+
+    def read_during_hold():
+        import time
+
+        time.sleep(1.0)
+        result = reader.call_tool("memory_get", {"key": "r"})
+        read_during_hold.result_text = _text(result)
+        read_during_hold.is_error = result.get("isError") is True
+
+    read_during_hold.result_text = None
+    read_during_hold.is_error = True
+    t = threading.Thread(target=read_during_hold)
+    t.start()
+    writer.call_tool("lock_hold", {"seconds": 2.0})
+    t.join(timeout=20.0)
+    assert not t.is_alive(), "reader thread hung behind the write lock"
+    assert read_during_hold.is_error is False, read_during_hold.result_text
+    assert "r = v" in read_during_hold.result_text
+
+    import sqlite3 as s3
+
+    conn = s3.connect(db_path)
+    try:
+        n_gets = conn.execute("SELECT COUNT(*) FROM events WHERE action='get'").fetchone()[0]
+    finally:
+        conn.close()
+    assert n_gets == 0, "MCP_LOG_READS=off still logged reads"
+
+
+def test_log_reads_default_records_get_events(make_client, tmp_path):
+    client = _memory_client(make_client, tmp_path)
+    client.call_tool("memory_set", {"key": "r", "value": "v"})
+    client.call_tool("memory_get", {"key": "r"})
+    import sqlite3
+
+    conn = sqlite3.connect(str(tmp_path / "memory.db"))
+    try:
+        n_gets = conn.execute("SELECT COUNT(*) FROM events WHERE action='get'").fetchone()[0]
+    finally:
+        conn.close()
+    assert n_gets >= 1, "default config should log get events"
+
+
 def test_list_by_prefix(make_client, tmp_path):
     client = _memory_client(make_client, tmp_path)
     for key, value in [("a/one", "1"), ("a/two", "2"), ("b/three", "3")]:
@@ -159,10 +239,10 @@ def test_last_write_wins_with_attribution_and_history(make_client, tmp_path):
     event_lines = [line for line in events_part.splitlines() if line.strip()]
     assert any("cursor set: cursor said A" in line for line in event_lines)
     assert any("claude set: claude said B" in line for line in event_lines)
-    assert [line for line in event_lines if "cursor" in line][0].startswith("  ")
+    assert next(line for line in event_lines if "cursor" in line).startswith("  ")
     assert event_lines.index(
-        next(l for l in event_lines if "cursor said A" in l)
-    ) < event_lines.index(next(l for l in event_lines if "claude said B" in l))
+        next(line for line in event_lines if "cursor said A" in line)
+    ) < event_lines.index(next(line for line in event_lines if "claude said B" in line))
 
 
 def test_database_is_in_wal_mode(make_client, tmp_path):

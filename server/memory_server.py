@@ -42,12 +42,12 @@ Run it (usually via your client, not directly):
 
 import functools
 import os
-from pathlib import Path
 import sqlite3
 import sys
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np  # embeddings math (Phase 4A); trivial install, no heavy deps
 
@@ -62,6 +62,17 @@ BUSY_TIMEOUT_MS = int(os.environ.get("MCP_SQLITE_BUSY_TIMEOUT", "5000"))
 DEFAULT_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "anonymous")
 # Phase 4A: set MCP_EMBEDDINGS=off for a lean server with no ML dependencies.
 EMBEDDINGS_ENABLED = os.environ.get("MCP_EMBEDDINGS", "1") != "off"
+# Input limits: keys/values are TEXT in a shared store and nothing else
+# bounds them, so without caps a single caller could bloat the db with a
+# multi-MB value. Sized for facts, not documents (env-overridable).
+MAX_KEY_LEN = int(os.environ.get("MCP_MAX_KEY_LEN", "256"))
+MAX_VALUE_LEN = int(os.environ.get("MCP_MAX_VALUE_LEN", "16384"))
+# Read logging: by default every memory_get appends an events row -- which
+# makes each read a WRITE (write lock + WAL frames). Set MCP_LOG_READS=off
+# for a truly read-only memory_get (it then completes even while another
+# process holds the write lock, even at busy_timeout=0), at the cost of
+# losing read attribution in the audit trail.
+LOG_READS = os.environ.get("MCP_LOG_READS", "1") != "off"
 
 mcp = MCPServer("memory-server")
 
@@ -86,6 +97,18 @@ _SERVER_LOCK = threading.RLock()
 def _now() -> str:
     """UTC timestamp, sortable, millisecond precision."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+
+
+def _validate(key: str, value: str | None = None) -> None:
+    """Enforce input size caps. ToolError so the message survives to the
+    client (mcp 2.x flattens arbitrary exceptions -- see _tool_guard)."""
+    if not key or len(key) > MAX_KEY_LEN:
+        raise ToolError(f"key must be 1..{MAX_KEY_LEN} characters (got {len(key)})")
+    if value is not None and len(value) > MAX_VALUE_LEN:
+        raise ToolError(
+            f"value exceeds {MAX_VALUE_LEN} characters (got {len(value)}); "
+            "this store is for facts, not documents"
+        )
 
 
 def _db() -> sqlite3.Connection:
@@ -272,6 +295,7 @@ def _guarded_set(
     cid = client_id or DEFAULT_CLIENT_ID
     if require_absent and expected_value is not None:
         raise ToolError("require_absent and expected_value are mutually exclusive")
+    _validate(key, value)
     db = _db()
     # Embed BEFORE opening the write transaction: the first call loads the
     # model (~seconds) and must not hold SQLite's write lock while doing it.
@@ -341,7 +365,6 @@ def _guarded_set(
 
 
 @mcp.tool()
-@_tool_guard
 def memory_set(
     key: str,
     value: str,
@@ -363,6 +386,9 @@ def memory_set(
     Every attempt is logged -- successful writes as 'set', failed CAS/
     create-only attempts as 'cas_fail' -- so see memory_history to debug
     who tried to write what, and who lost."""
+    # Thin facade: the guarded implementation does the work, so the guard
+    # (and its MCP_DEBUG_LOG entry) wraps each call exactly ONCE. Wrapping
+    # both layers double-logged every set -- caught in code review.
     return _guarded_set(key, value, client_id, expected_value, require_absent)
 
 
@@ -371,9 +397,15 @@ def memory_set(
 def memory_get(key: str, include_events: bool = False) -> str:
     """Fetch a fact by exact key. With include_events=True, appends the
     key's full write history from the events log."""
+    _validate(key)
     row = _db().execute("SELECT value, source_client, updated_at FROM facts WHERE key = ?", (key,)).fetchone()
-    _log(DEFAULT_CLIENT_ID, "get", key, None)  # reads are logged too, attributed to this server's client
-    _db().commit()
+    if LOG_READS:
+        # Reads are logged -- which makes them WRITES: they take the write
+        # lock and can block behind another process's transaction (or fail
+        # at busy_timeout=0). MCP_LOG_READS=off gives a genuinely read-only
+        # get, giving up read attribution. See README design notes.
+        _log(DEFAULT_CLIENT_ID, "get", key, None)
+        _db().commit()
     if row is None:
         # ToolError => isError=true with this message intact (mcp 2.x drops
         # the message of arbitrary exceptions; anticipated errors survive).
@@ -472,6 +504,7 @@ def memory_history(key: str, include_reads: bool = False) -> str:
 def memory_delete(key: str, client_id: str | None = None) -> str:
     """Delete a fact by key. No-op if the key doesn't exist (still logged)."""
     cid = client_id or DEFAULT_CLIENT_ID
+    _validate(key)
     db = _db()
     with db:
         cur = db.execute("DELETE FROM facts WHERE key = ?", (key,))
