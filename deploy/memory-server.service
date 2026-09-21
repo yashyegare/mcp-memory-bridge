@@ -1,0 +1,30 @@
+# systemd unit for the lean (no-ML) memory server in HTTP mode.
+# Installed by deploy/setup.sh. The server binds 127.0.0.1 only --
+# it is never exposed directly; a cloudflared tunnel terminates public
+# TLS and proxies to localhost (see docs/DEPLOY.md).
+
+[Unit]
+Description=MCP memory server (streamable-HTTP, bearer token)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=memory
+Group=memory
+# Holds MCP_AUTH_TOKEN etc.; chmod 600, owned by 'memory' (setup.sh).
+EnvironmentFile=/opt/mcp-memory/env
+WorkingDirectory=/opt/mcp-memory/repo
+ExecStart=/opt/mcp-memory/venv/bin/python server/memory_server.py /opt/mcp-memory/data/memory.db
+Restart=on-failure
+RestartSec=2
+
+# Hardening: a key/value demo server needs almost nothing.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/mcp-memory/data
+
+[Install]
+WantedBy=multi-user.target

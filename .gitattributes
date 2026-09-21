@@ -1,0 +1,3 @@
+# Shell scripts must stay LF: deploy/setup.sh runs on a Debian VM, and a
+# CRLF checkout breaks bash with cryptic '\r' errors.
+*.sh text eol=lf

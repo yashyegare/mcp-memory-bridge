@@ -34,7 +34,10 @@ through libraries that hide the interesting parts.
 
 Phase 4C adds an HTTP mode where one long-running server hosts many remote
 clients over the network (bearer-token gated) — see below and
-[docs/AUTH.md](docs/AUTH.md) for the trust model.
+[docs/AUTH.md](docs/AUTH.md) for the trust model. The server deploys to a
+GCP always-free e2-micro behind a Cloudflare Tunnel with no public IP —
+[docs/DEPLOY.md](docs/DEPLOY.md) walks the whole console path and the
+zero-bill guarantees.
 
 ## Results at a glance
 
@@ -85,6 +88,8 @@ tools/
 tests/                 # integration tests: real subprocesses, real wire protocol
 docs/NOTES.md          # the debugging stories: what broke and why
 docs/AUTH.md           # HTTP transport: auth scheme and its honest limits
+docs/DEPLOY.md         # GCP free-tier deploy: e2-micro + Cloudflare Tunnel
+deploy/                # systemd unit + one-shot VM setup script
 ```
 
 ## How it's built
