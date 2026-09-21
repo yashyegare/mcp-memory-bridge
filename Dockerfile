@@ -13,7 +13,7 @@ WORKDIR /app
 
 # Lean mode: only the two runtime deps the server needs without ML.
 COPY requirements.txt .
-RUN pip install --no-cache-dir mcp==2.2.0 numpy==2.5.3
+RUN pip install --no-cache-dir mcp==2.2.0 numpy==2.2.6
 
 COPY server/memory_server.py server/memory_server.py
 
