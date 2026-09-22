@@ -1,7 +1,7 @@
 # systemd unit for the lean (no-ML) memory server in HTTP mode.
 # Installed by deploy/setup.sh. The server binds 127.0.0.1 only --
 # it is never exposed directly; a cloudflared tunnel terminates public
-# TLS and proxies to localhost (see docs/DEPLOY.md).
+# TLS and proxies to localhost (README.md: Deployed on GCP free tier).
 
 [Unit]
 Description=MCP memory server (streamable-HTTP, bearer token)

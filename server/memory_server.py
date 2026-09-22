@@ -77,8 +77,8 @@ MAX_VALUE_LEN = int(os.environ.get("MCP_MAX_VALUE_LEN", "16384"))
 LOG_READS = os.environ.get("MCP_LOG_READS", "1") != "off"
 # Phase 4C: HTTP transport. stdio stays the default (one server subprocess
 # per client); MCP_TRANSPORT=http serves streamable-HTTP instead, so remote
-# clients can share ONE server (and one store) over the network. See
-# docs/AUTH.md for the trust model behind the token requirement.
+# clients can share ONE server (and one store) over the network. The
+# trust model behind the token requirement lives in README.md, Phase 4C.
 TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
@@ -581,8 +581,9 @@ def _bearer_auth_asgi(app, token: str):
     Pure ASGI middleware (no Starlette import needed): rejects unauthenticated
     requests BEFORE the MCP layer parses a body or touches the db. Response
     body is a JSON-RPC error object so even protocol-pure clients get an
-    interpretable failure. See docs/AUTH.md for what this does and does not
-    claim. Compares with hmac.compare_digest (timing-attack safe); a missing
+    interpretable failure. See README.md (Phase 4C, auth design) for what
+    this does and does not claim. Compares with hmac.compare_digest
+    (timing-attack safe); a missing
     header must not leak whether a token is even configured.
     """
 
@@ -612,7 +613,7 @@ def _bearer_auth_asgi(app, token: str):
 
 def _run_http() -> None:
     """Serve streamable-HTTP with the auth wrapper. Fails closed: no token,
-    no server (docs/AUTH.md). json_response=True returns plain JSON bodies
+    no server (README.md, Phase 4C). json_response=True returns plain JSON bodies
     instead of SSE streams, which is what a hand-rolled client wants to
     parse. DNS-rebinding protection stays ON; MCP_ALLOWED_HOSTS extends its
     allow-list to whatever public hostname actually fronts this server
@@ -620,7 +621,7 @@ def _run_http() -> None:
     PUBLIC_HOSTS comment above for why that's required, not optional."""
     if not AUTH_TOKEN:
         print("refusing to start: MCP_TRANSPORT=http requires MCP_AUTH_TOKEN "
-              "(docs/AUTH.md)", file=sys.stderr)
+              "(README.md, Phase 4C: auth design)", file=sys.stderr)
         sys.exit(2)
     import uvicorn  # already an mcp dependency
     from mcp.server.transport_security import TransportSecuritySettings

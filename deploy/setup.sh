@@ -51,7 +51,7 @@ if [ ! -x /usr/local/bin/cloudflared ]; then
   dpkg -i /tmp/cloudflared.deb
 fi
 mkdir -p /etc/cloudflared
-# Owns the tunnel; config written by docs/DEPLOY.md step 4.
+# Owns the tunnel; config written by README.md, "Deployed on GCP free tier" step 4.
 chown -R memory:memory /etc/cloudflared
 
 # --- start --------------------------------------------------------------
@@ -60,4 +60,4 @@ systemctl restart memory-server.service
 systemctl --no-pager status memory-server.service | head -12 || true
 
 echo
-echo "Next (as the tunnel user): docs/DEPLOY.md, step 4 — cloudflared tunnel login."
+echo "Next (as the tunnel user): README.md, 'Deployed on GCP free tier' step 3 — tailscale up."

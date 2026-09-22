@@ -7,9 +7,13 @@ spawn their own tools — nothing shares memory between them. This project
 builds a **shared-memory MCP server**: one SQLite store that multiple
 independent clients read and write concurrently, with attribution and an
 audit trail for every change — plus a **from-scratch MCP client** (raw
-JSON-RPC 2.0 over stdio, no SDK) used to exercise it.
+JSON-RPC 2.0, no SDK) used to exercise it over both stdio and HTTP.
+
+**Two transport modes, one store:**
 
 ```
+stdio mode — each client spawns its own server subprocess:
+
  ┌──────────────┐   ┌──────────────┐   ┌───────────────┐
  │ Claude       │   │ Cursor /     │   │ raw_client.py │
  │ Desktop      │   │ any MCP host │   │ (hand-rolled, │
@@ -18,7 +22,7 @@ JSON-RPC 2.0 over stdio, no SDK) used to exercise it.
         │  stdio           │  stdio           │  stdio
         ▼                  ▼                  ▼
  ┌─────────────────────────────────────────────────────┐
- │ memory_server.py — one MCP server per client,       │
+ │ memory_server.py — one subprocess per client,       │
  │ all pointing at the same store                      │
  └──────────────────────────┬──────────────────────────┘
                             ▼
@@ -27,17 +31,27 @@ JSON-RPC 2.0 over stdio, no SDK) used to exercise it.
               │ events audit trail +     │
               │ fact_embeddings          │
               └──────────────────────────┘
+
+HTTP mode — one long-running server hosts many remote clients (LIVE):
+```
+
+```
+ ┌────────────┐  HTTPS  ┌────────────────────────────────────────┐
+ │ any MCP    │────┬───►│ GCP e2-micro (always free, no public   │
+ │ client     │    │    │ IP, zero open ports)                   │
+ │ anywhere   │    │    │  Tailscale Funnel — outbound-only      │
+ └────────────┘    │    │  tunnel, TLS at the edge               │
+ ┌────────────┐    │    │   └─ memory_server.py (HTTP mode,      │
+ │ raw_client │────┘    │       bearer-token gated)              │
+ └────────────┘         │       └─ SQLite (WAL), same schema     │
+                        └────────────────────────────────────────┘
 ```
 
 Built to understand the protocol and its concurrency behavior by hand, not
-through libraries that hide the interesting parts.
-
-Phase 4C adds an HTTP mode where one long-running server hosts many remote
-clients over the network (bearer-token gated) — see below and
-[docs/AUTH.md](docs/AUTH.md) for the trust model. The server deploys to a
-GCP always-free e2-micro behind a Cloudflare Tunnel with no public IP —
-[docs/DEPLOY.md](docs/DEPLOY.md) walks the whole console path and the
-zero-bill guarantees.
+through libraries that hide the interesting parts. **The HTTP mode is not a
+diagram**: a GCP always-free e2-micro is running it right now, reachable
+over a stable public HTTPS URL — [Deployed on GCP free tier](#deployed-on-gcp-free-tier)
+below is the complete, verified walkthrough.
 
 ## Results at a glance
 
@@ -47,18 +61,27 @@ zero-bill guarantees.
 | Live race: Claude Desktop vs raw client | Desktop's `magenta` write landed mid-stream, held the key for **124 ms**, then lost to last-write-wins — and Desktop *read back the value that replaced it* |
 | Contention | ~2,500 writes across two independent clients, **0 protocol errors** (WAL + busy_timeout + LWW) |
 | Semantic recall | Query *"appearance preference for screens"* — words absent from every stored fact — still retrieved `user/theme` at cosine 0.427 (unrelated fact: 0.036) |
+| Remote, over the public internet | `RawHTTPMCPClient` on a Windows laptop → GCP VM via Tailscale Funnel: handshake, `memory_set`, attributed in the same events table — with auth enforced end to end |
 | Warm latency, enforced by tests | `memory_set` ~10 ms (limit 100), `memory_search` ~10 ms (limit 50) |
 
-## Setup
+## Quickstart
 
 ```bash
 python -m venv venv
-venv\Scripts\pip install -r requirements.txt        # Windows
+venv\Scripts\pip install -r requirements.txt                  # Windows
 source venv/bin/activate && pip install -r requirements.txt   # Linux/macOS
+
+# 37 integration tests: real subprocesses, real wire protocol
+venv\Scripts\python.exe -m pytest tests\ -v                   # Windows
+venv/bin/python -m pytest tests/ -v                           # Linux/macOS
+
+# Phase 1 smoke test: hand-rolled client vs the trivial SDK server
+venv\Scripts\python.exe client\raw_client.py                  # Windows
+venv/bin/python client/raw_client.py                          # Linux/macOS
 ```
 
 All commands below use `venv\Scripts\python.exe` (Windows); on Linux/macOS
-use `venv/bin/python` or activate the venv.
+use `venv/bin/python`.
 
 **Docker (lean mode).** The server ships as an image with the ML stack
 excluded (`MCP_EMBEDDINGS=off` baked in) — useful when a host prefers
@@ -86,19 +109,13 @@ tools/
   lock_demo.py         # deterministic lock-contention demo
   inspect_memory.py    # pretty-print the store / history / search log
 tests/                 # integration tests: real subprocesses, real wire protocol
-docs/NOTES.md          # the debugging stories: what broke and why
-docs/AUTH.md           # HTTP transport: auth scheme and its honest limits
-docs/DEPLOY.md         # GCP free-tier deploy: e2-micro + Cloudflare Tunnel
 deploy/                # systemd unit + one-shot VM setup script
+docs/NOTES.md          # the debugging stories: what broke and why
 ```
 
 ## How it's built
 
 ### Phase 1 — raw MCP client (no SDK)
-
-```bash
-venv\Scripts\python.exe client\raw_client.py
-```
 
 Implemented by hand against `test_server.py`:
 
@@ -190,10 +207,10 @@ venv\Scripts\python.exe tools\inspect_memory.py --searches        # search log
 stdio gives every client its own server subprocess. `MCP_TRANSPORT=http`
 flips the server to **streamable-HTTP** so one long-running server hosts any
 number of remote clients on the same store — the shape you'd actually
-deploy (and the prerequisite for the planned cloud demo):
+deploy:
 
 ```bash
-# server (fail-closed: no token, no start — see docs/AUTH.md)
+# server (fail-closed: no token, no start)
 MCP_TRANSPORT=http MCP_AUTH_TOKEN=<secret> \
   venv/Scripts/python.exe server/memory_server.py memory.db
 
@@ -203,13 +220,173 @@ venv/Scripts/python.exe -c "import sys; sys.path.insert(0,'client'); from raw_cl
 
 What the HTTP mode teaches that stdio hides (both sides hand-rolled over
 `urllib`): identity is a *header* (`Mcp-Session-Id` is issued at initialize
-and echoed thereafter), HTTP status codes live a layer below JSON-RPC
-(401 before any `error` object exists), and `json_response=True` turns the
-streamable-HTTP transport's default SSE stream into plain JSON bodies a
-raw client can parse. Auth is one shared bearer token checked in pure-ASGI
-middleware *before* the MCP layer parses anything — and the design doc is
-explicit that the token authenticates the installation, not the user:
-attribution stays trust-based over HTTP too.
+and echoed thereafter), HTTP status codes live a layer below JSON-RPC (401
+before any `error` object exists), and `json_response=True` turns the
+streamable-HTTP transport's default SSE stream into plain JSON bodies a raw
+client can parse.
+
+**Auth design.** The stdio server never needed auth — the OS *is* the
+authentication: a host spawns the server as a child process, so only
+something with filesystem access could talk to it, and anything with
+filesystem access could open the SQLite file directly. A listening socket
+changes that completely. The scheme:
+
+- **One shared bearer token, fail-closed.** `MCP_TRANSPORT=http` refuses to
+  start without `MCP_AUTH_TOKEN`. Every `/mcp` request must carry
+  `Authorization: Bearer <token>`; anything else gets `401` with a
+  JSON-RPC `error` object and `WWW-Authenticate: Bearer` — no body parsing,
+  no DB access, auth happens before the MCP layer sees anything. Compared
+  with `hmac.compare_digest` (timing-safe); the token is never logged.
+- **What the token does NOT buy — said out loud.** It authenticates the
+  *installation*, not the user. `client_id` remains a plain tool argument:
+  a caller can claim `client_id="claude-desktop"` and poison the audit
+  trail *even with a valid token*. Attribution stays self-reported; the
+  threat model remains "debugging aid, not security" over HTTP too. One
+  shared secret also means no per-client identity, no revocation, no
+  scopes — "rotate it" is the only leak response. The natural evolution
+  (if identity ever matters): per-client tokens minted server-side, with
+  the server *assigning* identity.
+- **Why not the SDK's OAuth machinery.** mcp 2.x ships full OAuth 2.1
+  resource-server support — right tool for public multi-tenant, ~10× the
+  moving parts a single-operator demo needs.
+- **DNS-rebinding protection vs tunnels.** The SDK's streamable-HTTP app
+  validates the `Host` header and defaults to localhost-only, so a request
+  arriving via *any* public tunnel is rejected with `421` before auth or
+  the MCP layer. Correct behavior, not a tunnel bug: the public hostname
+  must be allow-listed via `MCP_ALLOWED_HOSTS` (comma-separated), which
+  extends the protection rather than disabling it.
+
+### Deployed on GCP free tier
+
+The live instance: one always-free **e2-micro** VM (us-west1) running the
+**lean** server (`MCP_EMBEDDINGS=off` — the embedding model wants ~500 MB
+and the VM has 1 GB RAM; semantic search stays a laptop feature) in HTTP
+mode, reachable through a **Tailscale Funnel** — no public IP, no open
+firewall ports, no domain to buy, a stable HTTPS URL with auto-provisioned
+TLS. (A Cloudflare Tunnel works identically if you'd rather; it needs a
+domain for a stable URL, which is why Tailscale won. Funnel is beta —
+fine for a demo, worth knowing if you ever need guarantees.)
+
+**Bill safety, in order of appearance:** (1) a Free Trial billing account
+*cannot charge you* — when the 90-day/$300 trial lapses, resources stop;
+charging starts only if you manually upgrade. (2) Even on a paid account
+this deploy uses only Always-Free resources: e2-micro hours in
+us-central1/us-east1/us-west1 + 30 GB standard disk + ~1 GB egress — and
+**no external IP**, the one thing that would cost extra. (3) The 100%
+guarantee is deleting the project (see teardown).
+
+**Step 0 — console (~10 min).** Pick or create the project; **Billing →
+Budgets & alerts**: amount `$1`, thresholds 50/90/100%, your email — the
+alarm bell rings at $0.50; note the project ID.
+
+**Step 1 — the VM (~10 min).** Compute Engine → Create instance:
+
+| Field | Value |
+|---|---|
+| Name | `memory-server` |
+| Region | `us-west1` — always-free; us-central1/us-east1 also OK |
+| Machine type | **e2-micro** (2 vCPU shared, 1 GB RAM) |
+| Boot disk | **Standard** persistent disk, **30 GB**, **Debian 12** |
+| Firewall | leave **both boxes unchecked** — we open nothing |
+
+Then instance → Edit → Network interfaces → default → **External IP →
+None**. Or create it right the first time:
+
+```bash
+gcloud compute instances create memory-server \
+  --zone=us-west1-b --machine-type=e2-micro \
+  --image-family=debian-12 --image-project=debian-cloud \
+  --boot-disk-size=30GB --boot-disk-type=pd-standard --no-address
+```
+
+**Step 2 — code + service on the VM (~10 min).** In the browser-SSH window:
+
+```bash
+sudo apt-get update && sudo apt-get install -y git python3-venv curl
+git clone https://github.com/yashyegare/mcp-memory-bridge.git
+cd mcp-memory-bridge
+sudo bash deploy/setup.sh        # creates 'memory' user, /opt/mcp-memory/repo,
+                                 # lean venv (mcp+numpy, no torch), systemd unit
+openssl rand -hex 32             # your bearer token
+
+sudo tee /opt/mcp-memory/env >/dev/null <<EOF
+MCP_TRANSPORT=http
+MCP_HTTP_HOST=127.0.0.1
+MCP_HTTP_PORT=8000
+MCP_AUTH_TOKEN=<paste-your-token>
+MCP_EMBEDDINGS=off
+MCP_CLIENT_ID=gcp-server
+EOF
+sudo chmod 600 /opt/mcp-memory/env && sudo chown memory:memory /opt/mcp-memory/env
+sudo systemctl restart memory-server && sudo systemctl status memory-server --no-pager
+# want: active (running). "active then inactive (dead), status=0/SUCCESS" means
+# it booted in stdio mode — MCP_TRANSPORT=http didn't reach the env file.
+
+curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8000/mcp \
+  -H 'Content-Type: application/json' -H 'Accept: application/json' \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'
+# expect: 401 — auth layer live; we sent no token
+```
+
+**Step 3 — Tailscale (~5 min).** Still on the VM:
+
+```bash
+curl -fsSL https://tailscale.com/install.sh | sh
+sudo tailscale up     # open the printed login URL on your LAPTOP; free plan
+sudo tailscale status # memory-server active with a 100.x.x.x tailnet IP
+```
+
+**Step 4 — Funnel + allow the hostname (~5 min).**
+
+```bash
+sudo tailscale funnel --bg 8000      # --bg persists across reboots/re-logins
+sudo tailscale funnel status         # prints your URL: https://<device>.<tailnet>.ts.net
+```
+
+Before testing from outside, allow that exact hostname (DNS-rebinding
+protection, above) and restart:
+
+```bash
+sudo sed -i '/MCP_CLIENT_ID/a MCP_ALLOWED_HOSTS=<your-host>.ts.net' /opt/mcp-memory/env
+sudo systemctl restart memory-server
+```
+
+**Step 5 — prove it from your laptop.**
+
+```powershell
+venv\Scripts\python.exe -c "import sys; sys.path.insert(0,'client'); from raw_client import RawHTTPMCPClient; c=RawHTTPMCPClient('https://YOUR-HOST.ts.net/mcp', token='YOUR-TOKEN'); c.initialize(); print([t['name'] for t in c.list_tools()]); print(c.call_tool('memory_set',{'key':'cloud/hello','value':'written from my laptop','client_id':'laptop'}).get('content')[0].get('text')); c.close()"
+```
+
+A tool list plus a successful `memory_set` means genuinely reachable from
+the public internet, over a stable URL, with auth enforced. The two-machine
+demo: this client while a second machine hammers the same key —
+`tools/inspect_memory.py` on the VM shows the interleaved, attributed
+writes from genuinely different machines.
+
+**Day-2 ops (on the VM):**
+
+```bash
+sudo systemctl status memory-server        # is the API up?
+sudo journalctl -u memory-server -n 50     # last 50 log lines
+sudo systemctl restart memory-server       # after code or env changes
+sudo tailscale funnel status               # Funnel still on? URL?
+cd ~/mcp-memory-bridge && git pull && sudo bash deploy/setup.sh   # update
+```
+
+**Rotating the token** (anyone saw it — screen-share, pasted log, chat):
+
+```bash
+openssl rand -hex 32
+sudo sed -i 's/MCP_AUTH_TOKEN=.*/MCP_AUTH_TOKEN=<new-token>/' /opt/mcp-memory/env
+sudo systemctl restart memory-server
+```
+
+**Teardown — the only 100% guarantee.** When the demo has served (or day
+~55 of the trial): delete the VM (ends the Funnel with it), then IAM &
+Admin → Settings → **Shut down** deletes the whole project after ~30 days;
+optionally close the billing account and remove the payment method. A
+calendar reminder for **day ~55** saying "teardown" is the most reliable
+ops tool in this README.
 
 ## Configuration
 
@@ -227,15 +404,11 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 | `MCP_TRANSPORT` | `stdio` (default, one subprocess per client) or `http` |
 | `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | bind address for the HTTP transport (default localhost:8000) |
 | `MCP_AUTH_TOKEN` | bearer token; **required** when `MCP_TRANSPORT=http` (server refuses to start without it) |
+| `MCP_ALLOWED_HOSTS` | comma-separated public hostnames (e.g. a Tailscale Funnel host) allowed past the SDK's DNS-rebinding `Host` check — see Phase 4C |
 | `MCP_ENABLE_DEMO_TOOLS` | `1` = add `lock_hold(seconds)` demo tool for contention demos |
 | `MCP_DEBUG_LOG` | path; server-side forensic record of every tool call |
 
 ## Tests
-
-```bash
-venv\Scripts\python.exe -m pytest tests\ -v    # Windows
-venv/bin/python -m pytest tests/ -v            # Linux/macOS
-```
 
 37 integration tests (35 transport/storage + 2 that load the embedding
 model: the semantic lifecycle and the latency benchmark); every test
@@ -279,8 +452,8 @@ suite doesn't pay the model load per test.
 - **Known trade-offs.** stdio keeps one server per client (the HTTP
   transport removes that limit when needed); values are plain TEXT;
   `memory_list` is a prefix `LIKE` scan (fine at this scale); over HTTP,
-  the token gates *access*, while attribution stays trust-based
-  ([docs/AUTH.md](docs/AUTH.md) draws that line explicitly).
+  the token gates *access*, while attribution stays trust-based (Phase 4C
+  draws that line explicitly).
 
 ## Debugging
 

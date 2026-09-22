@@ -8,3 +8,6 @@ __pycache__/
 hammer_timeline.log
 memory_debug.log
 .freebuff/
+# local scratch probes against the live deployment (contain real URLs/tokens)
+test_remote.py
+test_requests.py
