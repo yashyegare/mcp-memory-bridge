@@ -29,6 +29,15 @@ if [ ! -x "$BASE/venv/bin/python" ]; then
   "$BASE/venv/bin/pip" install --quiet "mcp==2.2.0" "numpy==2.2.6"
 fi
 
+# --- deploy the code (ProtectHome=true hides /home from the service, so
+# the repo must live outside it -- $REPO_DIR is just the git checkout) ----
+echo "== syncing code into $BASE/repo =="
+rm -rf "$BASE/repo"
+mkdir -p "$BASE/repo"
+cp -a "$REPO_DIR"/. "$BASE/repo"/
+rm -rf "$BASE/repo/.git" "$BASE/repo/venv" "$BASE/repo/.github"
+chown -R memory:memory "$BASE/repo"
+
 # --- systemd service ----------------------------------------------------
 cp "$REPO_DIR/deploy/memory-server.service" /etc/systemd/system/memory-server.service
 systemctl daemon-reload
