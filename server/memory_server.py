@@ -83,13 +83,15 @@ TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
-# Phase 4C: HTTP transport. stdio stays the default (one server subprocess
-# per client). MCP_TRANSPORT=http serves streamable-HTTP instead so remote
-# clients can share one store -- see docs/AUTH.md for the trust model.
-TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
-HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
-HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
-AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+# The SDK's streamable-HTTP app validates the incoming Host header against
+# an allow-list (DNS-rebinding protection) and, bound to 127.0.0.1, defaults
+# that list to localhost/127.0.0.1/::1 ONLY -- so a request arriving via any
+# public hostname (a Cloudflare Tunnel, Tailscale Funnel, a real domain) is
+# rejected with 421 "Invalid Host header" before it ever reaches auth or the
+# MCP layer. This is correct default behavior, not a bug in the tunnel --
+# whatever public hostname fronts this server must be explicitly allowed.
+# Comma-separated, e.g.: MCP_ALLOWED_HOSTS=memory-server.tailXXXX.ts.net
+PUBLIC_HOSTS = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
 
 mcp = MCPServer("memory-server")
 
@@ -612,18 +614,31 @@ def _run_http() -> None:
     """Serve streamable-HTTP with the auth wrapper. Fails closed: no token,
     no server (docs/AUTH.md). json_response=True returns plain JSON bodies
     instead of SSE streams, which is what a hand-rolled client wants to
-    parse; DNS-rebinding protection is left ON for the default localhost
-    bind so a browser page cannot silently proxy requests at the server."""
+    parse. DNS-rebinding protection stays ON; MCP_ALLOWED_HOSTS extends its
+    allow-list to whatever public hostname actually fronts this server
+    (Tailscale Funnel, a Cloudflare Tunnel, a real domain) -- see the
+    PUBLIC_HOSTS comment above for why that's required, not optional."""
     if not AUTH_TOKEN:
         print("refusing to start: MCP_TRANSPORT=http requires MCP_AUTH_TOKEN "
               "(docs/AUTH.md)", file=sys.stderr)
         sys.exit(2)
     import uvicorn  # already an mcp dependency
+    from mcp.server.transport_security import TransportSecuritySettings
 
-    app = mcp.streamable_http_app(json_response=True)
+    security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *PUBLIC_HOSTS],
+        allowed_origins=[
+            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+            *(f"https://{h}" for h in PUBLIC_HOSTS),
+        ],
+    )
+    app = mcp.streamable_http_app(json_response=True, transport_security=security)
     wrapped = _bearer_auth_asgi(app, AUTH_TOKEN)
     print(f"http transport: http://{HTTP_HOST}:{HTTP_PORT}/mcp "
-          f"(bearer token required, json mode)", file=sys.stderr)
+          f"(bearer token required, json mode, allowed hosts: "
+          f"127.0.0.1/localhost/::1{', ' + ', '.join(PUBLIC_HOSTS) if PUBLIC_HOSTS else ''})",
+          file=sys.stderr)
     uvicorn.run(wrapped, host=HTTP_HOST, port=HTTP_PORT, log_level="warning")
 
 
