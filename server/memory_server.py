@@ -44,6 +44,7 @@ import functools
 import hmac
 import json
 import os
+import re
 import sqlite3
 import sys
 import threading
@@ -51,10 +52,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+import audit
 import numpy as np  # embeddings math (Phase 4A); trivial install, no heavy deps
 
 # mcp 2.x note: FastMCP was renamed to MCPServer (mcp 1.x import fails).
-from mcp.server.mcpserver import MCPServer
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
+from mcp.server.auth.provider import AccessToken
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 
 # Config via argv > env > defaults, so Claude Desktop / any launcher can
@@ -83,6 +87,7 @@ TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
 HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
 HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
 AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
+AUTH_CLIENTS_FILE = os.environ.get("MCP_AUTH_CLIENTS_FILE", "")
 # The SDK's streamable-HTTP app validates the incoming Host header against
 # an allow-list (DNS-rebinding protection) and, bound to 127.0.0.1, defaults
 # that list to localhost/127.0.0.1/::1 ONLY -- so a request arriving via any
@@ -136,15 +141,25 @@ def _db() -> sqlite3.Connection:
         # busy_timeout: how long a write waits for the lock before raising
         # "database is locked". 0ms = fail fast (for experiments), default
         # 5s = queue concurrent writers (the production setting).
-        _conn = sqlite3.connect(
+        conn = sqlite3.connect(
             DB_PATH,
             timeout=BUSY_TIMEOUT_MS / 1000.0,
             check_same_thread=False,  # SDK dispatches calls across threads; _SERVER_LOCK serializes
         )
-        _conn.row_factory = sqlite3.Row
-        _conn.execute("PRAGMA journal_mode=WAL;")      # readers don't block the writer
-        _conn.execute("PRAGMA synchronous=NORMAL;")    # WAL-safe durability trade-off
-        _conn.executescript(
+        try:
+            _initialize_db(conn)
+        except BaseException:
+            conn.close()
+            raise
+        _conn = conn
+    return _conn
+
+
+def _initialize_db(conn: sqlite3.Connection) -> None:
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")      # readers don't block the writer
+    conn.execute("PRAGMA synchronous=NORMAL;")    # WAL-safe durability trade-off
+    conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS facts (
                 key           TEXT PRIMARY KEY,
@@ -167,9 +182,8 @@ def _db() -> sqlite3.Connection:
                 embedding BLOB NOT NULL       -- normalized float32 vector (384 dims)
             );
             """
-        )
-        _conn.commit()
-    return _conn
+    )
+    audit.migrate(conn)
 
 
 # ---------------------------------------------------------------------- #
@@ -236,22 +250,18 @@ def _embed(texts: list[str]):
     return vectors.astype("float32")
 
 
-def _remember_search(query: str, matched_key: str, score: float) -> None:
-    """Log a search event with the query and its best match (audit trail
-    for semantic recall: what was asked, in which words, and what won)."""
-    db = _db()
-    with db:
-        db.execute(
-            "INSERT INTO events (timestamp, client_id, action, key, value) VALUES (?, ?, 'search', ?, ?)",
-            (_now(), DEFAULT_CLIENT_ID, matched_key, f"query={query!r} score={score:.3f}"),
-        )
+def _client_id(ctx: Context, claimed: str | None = None) -> str:
+    if TRANSPORT == "http" and AUTH_CLIENTS_FILE:
+        request = ctx.request_context.request
+        user = request.scope.get("user") if request is not None else None
+        if not isinstance(user, AuthenticatedUser):
+            raise ToolError("authenticated client identity unavailable")
+        return user.access_token.client_id
+    return claimed or DEFAULT_CLIENT_ID
 
 
 def _log(client_id: str, action: str, key: str | None, value: str | None) -> None:
-    _db().execute(
-        "INSERT INTO events (timestamp, client_id, action, key, value) VALUES (?, ?, ?, ?, ?)",
-        (_now(), client_id, action, key, value),
-    )
+    audit.append(_db(), _now(), client_id, action, key, value)
 
 
 def _tool_guard(fn):
@@ -270,20 +280,22 @@ def _tool_guard(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
         debug_path = os.environ.get("MCP_DEBUG_LOG")
+        if debug_path:
+            logged_kwargs = {key: value for key, value in kwargs.items() if key != "ctx"}
         start = time.time()
         try:
             with _SERVER_LOCK:  # serialize all db access across SDK worker threads
                 result = fn(*args, **kwargs)
             if debug_path:
                 with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"{_now()} OK   {fn.__name__} args={args} kwargs={kwargs} "
+                    f.write(f"{_now()} OK   {fn.__name__} args={args} kwargs={logged_kwargs} "
                             f"({time.time() - start:.3f}s) -> {str(result)[:200]}\n")
             return result
         except sqlite3.OperationalError as exc:  # outside the lock: nothing db-related to serialize
             if debug_path:
                 import traceback
                 with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={kwargs} "
+                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={logged_kwargs} "
                             f"({time.time() - start:.3f}s) {type(exc).__name__}: {exc}\n")
             if "locked" in str(exc) or "busy" in str(exc):
                 raise ToolError(
@@ -295,7 +307,7 @@ def _tool_guard(fn):
             if debug_path:
                 import traceback
                 with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={kwargs} "
+                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={logged_kwargs} "
                             f"({time.time() - start:.3f}s) {type(exc).__name__}: {exc}\n"
                             f"{''.join(traceback.format_exc())}\n")
             raise
@@ -307,11 +319,10 @@ def _tool_guard(fn):
 def _guarded_set(
     key: str,
     value: str,
-    client_id: str | None = None,
+    cid: str,
     expected_value: str | None = None,
     require_absent: bool = False,
 ) -> str:
-    cid = client_id or DEFAULT_CLIENT_ID
     if require_absent and expected_value is not None:
         raise ToolError("require_absent and expected_value are mutually exclusive")
     _validate(key, value)
@@ -368,17 +379,10 @@ def _guarded_set(
                     (key, embedding),
                 )
             _log(cid, "set", key, value)
-        # else: nothing was mutated (the failed INSERT raised and was
-        # caught; the failed UPDATE's rowcount==0 means no row changed),
-        # so this transaction commits as a no-op -- there's nothing to
-        # roll back.
+        else:
+            _log(cid, "cas_fail", key, cas_failure)
 
     if cas_failure is not None:
-        # Logged in its OWN transaction, after the attempt's transaction
-        # above already closed: a cas_fail event must survive even though
-        # the attempted write didn't, so it can't share that transaction.
-        _log(cid, "cas_fail", key, cas_failure)
-        db.commit()
         raise ToolError(f"CAS failed for {key!r}: {cas_failure}")
     return f"set {key!r} (from {cid})"
 
@@ -387,6 +391,7 @@ def _guarded_set(
 def memory_set(
     key: str,
     value: str,
+    ctx: Context,
     client_id: str | None = None,
     expected_value: str | None = None,
     require_absent: bool = False,
@@ -408,12 +413,12 @@ def memory_set(
     # Thin facade: the guarded implementation does the work, so the guard
     # (and its MCP_DEBUG_LOG entry) wraps each call exactly ONCE. Wrapping
     # both layers double-logged every set -- caught in code review.
-    return _guarded_set(key, value, client_id, expected_value, require_absent)
+    return _guarded_set(key, value, _client_id(ctx, client_id), expected_value, require_absent)
 
 
 @mcp.tool()
 @_tool_guard
-def memory_get(key: str, include_events: bool = False) -> str:
+def memory_get(key: str, ctx: Context, include_events: bool = False) -> str:
     """Fetch a fact by exact key. With include_events=True, appends the
     key's full write history from the events log."""
     _validate(key)
@@ -423,8 +428,8 @@ def memory_get(key: str, include_events: bool = False) -> str:
         # lock and can block behind another process's transaction (or fail
         # at busy_timeout=0). MCP_LOG_READS=off gives a genuinely read-only
         # get, giving up read attribution. See README design notes.
-        _log(DEFAULT_CLIENT_ID, "get", key, None)
-        _db().commit()
+        with _db():
+            _log(_client_id(ctx), "get", key, None)
     if row is None:
         # ToolError => isError=true with this message intact (mcp 2.x drops
         # the message of arbitrary exceptions; anticipated errors survive).
@@ -463,7 +468,7 @@ def memory_list(prefix: str = "") -> str:
 
 @mcp.tool()
 @_tool_guard
-def memory_search(query: str, top_k: int = 3) -> str:
+def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
     """Find facts by MEANING, not key: embeds the query and returns the
     top_k most similar facts by cosine similarity. Works with different
     words than were stored (e.g. query 'appearance preference' finds
@@ -488,7 +493,8 @@ def memory_search(query: str, top_k: int = 3) -> str:
     scored.sort(key=lambda pair: pair[0], reverse=True)
     top = scored[: max(1, top_k)]
     best_key, best_score = top[0][1]["key"], top[0][0]
-    _remember_search(query, best_key, best_score)
+    with _db():
+        _log(_client_id(ctx), "search", best_key, f"query={query!r} score={best_score:.3f}")
     lines = [
         f"{row['key']} = {row['value']}  (cosine {score:.3f}, source: {row['source_client']})"
         for score, row in top
@@ -520,9 +526,9 @@ def memory_history(key: str, include_reads: bool = False) -> str:
 
 @mcp.tool()
 @_tool_guard
-def memory_delete(key: str, client_id: str | None = None) -> str:
+def memory_delete(key: str, ctx: Context, client_id: str | None = None) -> str:
     """Delete a fact by key. No-op if the key doesn't exist (still logged)."""
-    cid = client_id or DEFAULT_CLIENT_ID
+    cid = _client_id(ctx, client_id)
     _validate(key)
     db = _db()
     with db:
@@ -542,19 +548,13 @@ if os.environ.get("MCP_ENABLE_DEMO_TOOLS") == "1":
 
     @mcp.tool()
     @_tool_guard
-    def lock_hold(seconds: float = 2.0) -> str:
+    def lock_hold(ctx: Context, seconds: float = 2.0) -> str:
         """[demo] Hold the SQLite write lock for `seconds`, then commit."""
-        db = _db()
-        db.execute("BEGIN IMMEDIATE")  # grab the write lock and keep it
-        db.execute(
-            "INSERT INTO events (timestamp, client_id, action, key, value) VALUES (?, ?, 'demo-lock-hold', NULL, NULL)",
-            (_now(), DEFAULT_CLIENT_ID),
-        )
-        import time
-
-        time.sleep(seconds)
-        db.commit()  # releases the lock
-        return f"held the write lock for {seconds}s (client {DEFAULT_CLIENT_ID!r})"
+        cid = _client_id(ctx)
+        with _db():
+            _log(cid, "demo-lock-hold", None, None)
+            time.sleep(seconds)
+        return f"held the write lock for {seconds}s (client {cid!r})"
 
 
 def _maybe_preload_model() -> None:
@@ -575,7 +575,24 @@ def _maybe_preload_model() -> None:
     threading.Thread(target=_load, daemon=True).start()
 
 
-def _bearer_auth_asgi(app, token: str):
+def _load_client_tokens(path: str) -> dict[bytes, str]:
+    clients = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(clients, dict) or not clients:
+        raise ValueError("expected a nonempty JSON object mapping client IDs to tokens")
+    credentials = {}
+    for client_id, token in clients.items():
+        if not re.fullmatch(r"[a-zA-Z0-9._-]{1,64}", client_id):
+            raise ValueError("client IDs must be 1-64 ASCII letters, digits, dots, underscores or hyphens")
+        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,}", token):
+            raise ValueError("tokens must have at least 32 bearer-token characters")
+        header = f"Bearer {token}".encode("ascii")
+        if header in credentials:
+            raise ValueError("each client must have a unique token")
+        credentials[header] = client_id
+    return credentials
+
+
+def _bearer_auth_asgi(app, credentials: dict[bytes, str | None]):
     """Wrap the streamable-HTTP ASGI app with a bearer-token check.
 
     Pure ASGI middleware (no Starlette import needed): rejects unauthenticated
@@ -591,10 +608,10 @@ def _bearer_auth_asgi(app, token: str):
         if scope["type"] != "http":
             await app(scope, receive, send)
             return
-        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
-        supplied = headers.get("authorization", "")
-        expected = f"Bearer {token}"
-        if not (supplied and hmac.compare_digest(supplied, expected)):
+        headers = [value for key, value in scope.get("headers", []) if key.lower() == b"authorization"]
+        matches = [client_id for header, client_id in credentials.items()
+                   if len(headers) == 1 and hmac.compare_digest(headers[0], header)]
+        if not matches:
             body = json.dumps({
                 "jsonrpc": "2.0",
                 "id": None,
@@ -606,6 +623,12 @@ def _bearer_auth_asgi(app, token: str):
                                     (b"content-length", str(len(body)).encode("ascii"))]})
             await send({"type": "http.response.body", "body": body})
             return
+        if (client_id := matches[0]) is not None:
+            # The SDK binds MCP sessions to this principal and passes the
+            # request scope into each tool's injected Context.
+            user = AuthenticatedUser(AccessToken(token=headers[0][7:].decode("ascii"),
+                                                 client_id=client_id, scopes=[]))
+            scope = {**scope, "user": user}
         await app(scope, receive, send)
 
     return _auth_middleware
@@ -619,9 +642,15 @@ def _run_http() -> None:
     allow-list to whatever public hostname actually fronts this server
     (Tailscale Funnel, a Cloudflare Tunnel, a real domain) -- see the
     PUBLIC_HOSTS comment above for why that's required, not optional."""
-    if not AUTH_TOKEN:
-        print("refusing to start: MCP_TRANSPORT=http requires MCP_AUTH_TOKEN "
-              "(README.md, Phase 4C: auth design)", file=sys.stderr)
+    if bool(AUTH_TOKEN) == bool(AUTH_CLIENTS_FILE):
+        print("refusing to start: MCP_TRANSPORT=http requires exactly one of "
+              "MCP_AUTH_TOKEN or MCP_AUTH_CLIENTS_FILE", file=sys.stderr)
+        sys.exit(2)
+    try:
+        credentials = (_load_client_tokens(AUTH_CLIENTS_FILE) if AUTH_CLIENTS_FILE
+                       else {f"Bearer {AUTH_TOKEN}".encode("latin-1"): None})
+    except (OSError, ValueError) as exc:
+        print(f"refusing to start: invalid HTTP auth configuration ({exc})", file=sys.stderr)
         sys.exit(2)
     import uvicorn  # already an mcp dependency
     from mcp.server.transport_security import TransportSecuritySettings
@@ -635,7 +664,7 @@ def _run_http() -> None:
         ],
     )
     app = mcp.streamable_http_app(json_response=True, transport_security=security)
-    wrapped = _bearer_auth_asgi(app, AUTH_TOKEN)
+    wrapped = _bearer_auth_asgi(app, credentials)
     print(f"http transport: http://{HTTP_HOST}:{HTTP_PORT}/mcp "
           f"(bearer token required, json mode, allowed hosts: "
           f"127.0.0.1/localhost/::1{', ' + ', '.join(PUBLIC_HOSTS) if PUBLIC_HOSTS else ''})",

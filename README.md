@@ -71,7 +71,7 @@ python -m venv venv
 venv\Scripts\pip install -r requirements.txt                  # Windows
 source venv/bin/activate && pip install -r requirements.txt   # Linux/macOS
 
-# 37 integration tests: real subprocesses, real wire protocol
+# Integration tests: real subprocesses, real wire protocol
 venv\Scripts\python.exe -m pytest tests\ -v                   # Windows
 venv/bin/python -m pytest tests/ -v                           # Linux/macOS
 
@@ -231,21 +231,15 @@ something with filesystem access could talk to it, and anything with
 filesystem access could open the SQLite file directly. A listening socket
 changes that completely. The scheme:
 
-- **One shared bearer token, fail-closed.** `MCP_TRANSPORT=http` refuses to
-  start without `MCP_AUTH_TOKEN`. Every `/mcp` request must carry
-  `Authorization: Bearer <token>`; anything else gets `401` with a
-  JSON-RPC `error` object and `WWW-Authenticate: Bearer` — no body parsing,
-  no DB access, auth happens before the MCP layer sees anything. Compared
-  with `hmac.compare_digest` (timing-safe); the token is never logged.
-- **What the token does NOT buy — said out loud.** It authenticates the
-  *installation*, not the user. `client_id` remains a plain tool argument:
-  a caller can claim `client_id="claude-desktop"` and poison the audit
-  trail *even with a valid token*. Attribution stays self-reported; the
-  threat model remains "debugging aid, not security" over HTTP too. One
-  shared secret also means no per-client identity, no revocation, no
-  scopes — "rotate it" is the only leak response. The natural evolution
-  (if identity ever matters): per-client tokens minted server-side, with
-  the server *assigning* identity.
+- **Bearer authentication.** HTTP requires exactly one of
+  `MCP_AUTH_TOKEN` or `MCP_AUTH_CLIENTS_FILE`. The server checks the
+  `Authorization: Bearer <token>` header before processing MCP requests.
+  Missing or invalid credentials receive `401`.
+- **Attribution.** Per-client tokens bind each HTTP session to a configured
+  identity. The server uses that identity for fact sources and audit events,
+  overriding the optional `client_id` tool argument. Shared-token HTTP and
+  stdio keep self-reported attribution. See [HTTP credentials](docs/AUTH.md)
+  for setup, token rotation, and revocation.
 - **Why not the SDK's OAuth machinery.** mcp 2.x ships full OAuth 2.1
   resource-server support — right tool for public multi-tenant, ~10× the
   moving parts a single-operator demo needs.
@@ -403,20 +397,66 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 | `MCP_MAX_KEY_LEN` / `MCP_MAX_VALUE_LEN` | input caps (defaults 256 / 16384 chars) |
 | `MCP_TRANSPORT` | `stdio` (default, one subprocess per client) or `http` |
 | `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | bind address for the HTTP transport (default localhost:8000) |
-| `MCP_AUTH_TOKEN` | bearer token; **required** when `MCP_TRANSPORT=http` (server refuses to start without it) |
+| `MCP_AUTH_TOKEN` | shared HTTP bearer token, with caller-supplied attribution |
+| `MCP_AUTH_CLIENTS_FILE` | path to a JSON file mapping client IDs to individual bearer tokens. Set exactly one HTTP credential option |
 | `MCP_ALLOWED_HOSTS` | comma-separated public hostnames (e.g. a Tailscale Funnel host) allowed past the SDK's DNS-rebinding `Host` check — see Phase 4C |
 | `MCP_ENABLE_DEMO_TOOLS` | `1` = add `lock_hold(seconds)` demo tool for contention demos |
 | `MCP_DEBUG_LOG` | path; server-side forensic record of every tool call |
 
-## Tests
+## Audit verification and recovery
 
-37 integration tests (35 transport/storage + 2 that load the embedding
-model: the semantic lifecycle and the latency benchmark); every test
-spawns a real server — a subprocess over stdio, or a live HTTP server
-exercised with raw `urllib` requests — and speaks the real wire protocol,
-including one where the server hangs silently and the client must time
-out, not hang. Non-semantic tests run with `MCP_EMBEDDINGS=off` so the
-suite doesn't pay the model load per test.
+Run these commands from the repository root with the project environment active.
+
+```sh
+python tools/memory_admin.py verify memory.db
+python tools/memory_admin.py backup memory.db memory-backup.zip
+python tools/memory_admin.py restore memory-backup.zip recovered.db
+python tools/memory_admin.py verify recovered.db --expected-head <head-from-backup>
+```
+
+Each event's SHA-256 hash covers its fields, event ID, and predecessor
+hash. Fact mutations and their audit events commit together. The first
+database access after upgrading seals existing events in ID order, so
+stop older server processes and make a pre-upgrade backup before opening
+a legacy database with the new server. Historical attribution retains
+the trust level it had when the event was recorded.
+
+`verify` reports the event count and chain head. A trusted head saved
+outside SQLite for the same snapshot also detects a truncated tail or a
+rewritten chain. Keep that head in a separately controlled location.
+Someone with database write access can recompute hashes, and the event
+chain covers the event records only.
+
+`backup` uses SQLite's online backup API to capture a consistent snapshot,
+including committed writes in WAL, while the server is running. The ZIP
+contains the database and its SHA-256 checksum. `restore` checks the
+checksum, SQLite integrity, and the audit chain before publishing the
+database at a fresh path. Both commands refuse to overwrite existing
+files and require a destination filesystem that supports hard links.
+Restrict access to backup archives. To switch to a recovered database,
+stop the server and point its DB path at the recovered file.
+
+The server uses WAL with `synchronous=NORMAL`. SQLite preserves database
+consistency after a power loss, but recent acknowledged commits can be
+lost before a sync. Recovery from an archive returns the snapshot taken
+by that backup.
+
+## Tests and benchmarks
+
+The integration suite speaks the real wire protocol over subprocess
+stdio and HTTP. The semantic lifecycle and latency tests load the
+embedding model. Lean server tests disable it.
+
+```sh
+python -m pytest tests/ -q
+python tools/bench_concurrency.py --clients 8 --writes 100
+```
+
+The benchmark runs concurrent writes to one key in a fresh shared SQLite
+database with one stdio subprocess per client. It reports p50, p99,
+successful writes per second, and failures, excluding setup and warmup.
+See [Scaling the store](docs/SCALING.md) for design options and measurement
+limits.
 
 ## Design decisions
 
@@ -436,12 +476,9 @@ suite doesn't pay the model load per test.
   event row, so **reads are writes** — they take the write lock and can
   queue behind another client. `MCP_LOG_READS=off` restores a genuinely
   read-only get at the cost of read attribution.
-- **Attribution is trust-based, by design.** `client_id` is a plain tool
-  argument — any caller can claim any identity. That's acceptable because
-  the store's threat model is *debugging*, not security: attribution answers
-  "who wrote this," not "is this allowed." Real auth would need the
-  transport layer to authenticate clients before a word of the protocol is
-  spoken.
+- **Identity follows the transport.** Stdio and shared-token HTTP accept
+  caller-supplied labels. Per-client HTTP assigns identity at authentication
+  and gives each authenticated client access to the same store.
 - **Input caps.** Keys and values are length-capped (defaults 256 / 16384)
   because a shared TEXT store with no limits is one `memory_set` away from
   a bloated database.
@@ -451,9 +488,8 @@ suite doesn't pay the model load per test.
   upgrade path if the store grows, not a day-one need.
 - **Known trade-offs.** stdio keeps one server per client (the HTTP
   transport removes that limit when needed); values are plain TEXT;
-  `memory_list` is a prefix `LIKE` scan (fine at this scale); over HTTP,
-  the token gates *access*, while attribution stays trust-based (Phase 4C
-  draws that line explicitly).
+  `memory_list` uses a prefix `LIKE` query, and write transactions serialize
+  across processes.
 
 ## Debugging
 

@@ -15,6 +15,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 
 import pytest
 from conftest import ROOT
@@ -30,19 +31,18 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.fixture(scope="module")
-def http_server(tmp_path_factory):
-    """One HTTP server for the whole module: boot is ~3s (uvicorn), the
-    tests share one db file, which is the point of the transport."""
+@contextmanager
+def _serve_http(db, **auth_env):
     port = _free_port()
-    db = tmp_path_factory.mktemp("http") / "memory.db"
     env = {
         **os.environ,
         "MCP_TRANSPORT": "http",
-        "MCP_AUTH_TOKEN": TOKEN,
+        "MCP_AUTH_TOKEN": "",
+        "MCP_AUTH_CLIENTS_FILE": "",
         "MCP_HTTP_HOST": "127.0.0.1",
         "MCP_HTTP_PORT": str(port),
         "MCP_EMBEDDINGS": "off",
+        **auth_env,
     }
     proc = subprocess.Popen(
         [sys.executable, MEMORY_SERVER, str(db)],
@@ -62,9 +62,17 @@ def http_server(tmp_path_factory):
     else:
         proc.kill()
         raise RuntimeError("http server never opened its port")
-    yield url
-    proc.terminate()
-    proc.wait(timeout=5)
+    try:
+        yield url
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+@pytest.fixture(scope="module")
+def http_server(tmp_path_factory):
+    with _serve_http(tmp_path_factory.mktemp("http") / "memory.db", MCP_AUTH_TOKEN=TOKEN) as url:
+        yield url
 
 
 @pytest.fixture()
@@ -145,7 +153,7 @@ def test_two_clients_share_the_store(http_server):
 def test_http_server_refuses_to_start_without_token(tmp_path):
     """Fail-closed: MCP_TRANSPORT=http without MCP_AUTH_TOKEN must exit
     nonzero with an explanatory message, never serve unauthenticated."""
-    env = {**os.environ, "MCP_TRANSPORT": "http", "MCP_AUTH_TOKEN": "",
+    env = {**os.environ, "MCP_TRANSPORT": "http", "MCP_AUTH_TOKEN": "", "MCP_AUTH_CLIENTS_FILE": "",
            "MCP_EMBEDDINGS": "off"}
     proc = subprocess.Popen(
         [sys.executable, MEMORY_SERVER, str(tmp_path / "m.db")],
@@ -158,3 +166,39 @@ def test_http_server_refuses_to_start_without_token(tmp_path):
             proc.kill()
     assert proc.returncode == 2
     assert b"MCP_AUTH_TOKEN" in stderr
+
+
+def test_per_client_tokens_bind_sessions_and_audit_identity(tmp_path):
+    db = tmp_path / "clients.db"
+    config = tmp_path / "clients.json"
+    alice_token, bob_token = "alice-" + "a" * 32, "bob-" + "b" * 32
+    config.write_text(json.dumps({"alice": alice_token, "bob": bob_token}), encoding="utf-8")
+    with _serve_http(db, MCP_AUTH_CLIENTS_FILE=str(config)) as url:
+        alice = RawHTTPMCPClient(url, alice_token)
+        bob = RawHTTPMCPClient(url, bob_token)
+        alice.initialize()
+        bob.initialize()
+        impostor = RawHTTPMCPClient(url, bob_token)
+        impostor.session_id = alice.session_id
+        with pytest.raises(ConnectionError, match="404"):
+            impostor.list_tools()
+        assert not alice.call_tool("memory_set", {"key": "who", "value": "A", "client_id": "bob"}).get("isError")
+        read = bob.call_tool("memory_get", {"key": "who"})
+        assert "source: alice" in read["content"][0]["text"]
+        failure = bob.call_tool("memory_set", {"key": "who", "value": "B", "require_absent": True})
+        assert failure["isError"]
+        assert not alice.call_tool("memory_delete", {"key": "who", "client_id": "bob"}).get("isError")
+        history = bob.call_tool("memory_history", {"key": "who", "include_reads": True})["content"][0]["text"]
+        assert [line.split()[1:3] for line in history.splitlines()] == [
+            ["alice", "set:"], ["bob", "get:"], ["bob", "cas_fail:"], ["alice", "delete:"],
+        ]
+        alice.close()
+        bob.close()
+
+    config.write_text(json.dumps({"bob": bob_token}), encoding="utf-8")
+    with _serve_http(db, MCP_AUTH_CLIENTS_FILE=str(config)) as url:
+        with pytest.raises(MCPError, match="401"):
+            RawHTTPMCPClient(url, alice_token).initialize()
+        bob = RawHTTPMCPClient(url, bob_token)
+        bob.initialize()
+        bob.close()
