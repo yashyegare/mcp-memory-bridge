@@ -15,7 +15,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir mcp==2.2.0 numpy==2.2.6
 
-COPY server/memory_server.py server/memory_server.py
+COPY server/memory_server.py server/audit.py server/
 
 ENV MCP_EMBEDDINGS=off
 # stdout is the JSON-RPC protocol channel; Python must not buffer it or the

@@ -253,6 +253,13 @@ class RawMCPClient:
                 self.proc.stdin.close()
         except OSError:
             pass
+        # Let stdio servers exit on EOF and release the database first.
+        # On Windows a venv launcher may be the process we can terminate.
+        try:
+            self.proc.wait(timeout=2)
+            return
+        except subprocess.TimeoutExpired:
+            pass
         try:
             self.proc.terminate()
             self.proc.wait(timeout=5)
