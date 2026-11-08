@@ -9,6 +9,7 @@ import sys
 
 import pytest
 from conftest import ROOT
+from test_memory_admin import _admin
 
 MEMORY_SERVER = str(ROOT / "server" / "memory_server.py")
 ST_AVAILABLE = importlib.util.find_spec("sentence_transformers") is not None
@@ -97,6 +98,21 @@ def test_semantic_search_full_lifecycle(make_client, tmp_path):
     # up in the key's history once reads/searches are included.
     events = _text(client.call_tool("memory_history", {"key": "user/theme", "include_reads": True}))
     assert "search" in events and "appearance preference" in events
+
+    db = tmp_path / "memory.db"
+    full, delta, restored = tmp_path / "full.zip", tmp_path / "delta.zip", tmp_path / "restored.db"
+    assert _admin("backup", db, full).returncode == 0
+    client.call_tool("memory_set", {"key": "user/theme", "value": "the user prefers bright screens"})
+    assert _admin("incremental", db, delta, "--since", full).returncode == 0
+    result = _admin("restore", full, restored, "--incremental", delta)
+    assert result.returncode == 0, result.stderr
+    assert _admin("verify", restored, "--replay").returncode == 0
+    recovered = make_client([sys.executable, MEMORY_SERVER, str(restored)],
+                            env={"MCP_EMBEDDINGS": "1"}, default_timeout=120)
+    recovered.initialize()
+    found = recovered.call_tool("memory_search", {"query": "bright screen preference"})
+    assert not found.get("isError")
+    assert "bright screens" in _text(found)
 
     # Delete cascades to the embedding: the deleted fact stops being findable.
     client.call_tool("memory_delete", {"key": "pet/name"})

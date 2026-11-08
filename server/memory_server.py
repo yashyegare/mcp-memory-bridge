@@ -32,39 +32,38 @@ near-simultaneous writers from different clients queue rather than
 fail with "database is locked". WAL mode matters ACROSS server
 processes (one per MCP client): readers there never block on another
 process's write transaction. Within one process the server-wide lock
-(see _SERVER_LOCK) serializes all tool calls anyway -- WAL is not
-buying in-process reader/writer concurrency, and the README says so
-explicitly.
+serializes database access. Write embeddings compute separately so reads
+can proceed while a writer prepares its vector.
 
 Run it (usually via your client, not directly):
     venv\\Scripts\\python.exe server/memory_server.py [path/to/memory.db]
 """
 
 import functools
-import hmac
-import json
 import os
-import re
 import sqlite3
 import sys
 import threading
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import audit
+import embeddings
+import http_transport
 import numpy as np  # embeddings math (Phase 4A); trivial install, no heavy deps
+import storage
 
 # mcp 2.x note: FastMCP was renamed to MCPServer (mcp 1.x import fails).
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
-from mcp.server.auth.provider import AccessToken
 from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
+from telemetry import METRICS, debug_event
 
 # Config via argv > env > defaults, so Claude Desktop / any launcher can
 # configure this server without touching code.
 DB_PATH = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("MCP_MEMORY_DB", "memory.db")
 BUSY_TIMEOUT_MS = int(os.environ.get("MCP_SQLITE_BUSY_TIMEOUT", "5000"))
+SYNCHRONOUS = os.environ.get("MCP_SQLITE_SYNCHRONOUS", "NORMAL").upper()
 DEFAULT_CLIENT_ID = os.environ.get("MCP_CLIENT_ID", "anonymous")
 # Phase 4A: set MCP_EMBEDDINGS=off for a lean server with no ML dependencies.
 EMBEDDINGS_ENABLED = os.environ.get("MCP_EMBEDDINGS", "1") != "off"
@@ -84,20 +83,7 @@ LOG_READS = os.environ.get("MCP_LOG_READS", "1") != "off"
 # clients can share ONE server (and one store) over the network. The
 # trust model behind the token requirement lives in README.md, Phase 4C.
 TRANSPORT = os.environ.get("MCP_TRANSPORT", "stdio")
-HTTP_HOST = os.environ.get("MCP_HTTP_HOST", "127.0.0.1")
-HTTP_PORT = int(os.environ.get("MCP_HTTP_PORT", "8000"))
-AUTH_TOKEN = os.environ.get("MCP_AUTH_TOKEN", "")
 AUTH_CLIENTS_FILE = os.environ.get("MCP_AUTH_CLIENTS_FILE", "")
-# The SDK's streamable-HTTP app validates the incoming Host header against
-# an allow-list (DNS-rebinding protection) and, bound to 127.0.0.1, defaults
-# that list to localhost/127.0.0.1/::1 ONLY -- so a request arriving via any
-# public hostname (a Cloudflare Tunnel, Tailscale Funnel, a real domain) is
-# rejected with 421 "Invalid Host header" before it ever reaches auth or the
-# MCP layer. This is correct default behavior, not a bug in the tunnel --
-# whatever public hostname fronts this server must be explicitly allowed.
-# Comma-separated, e.g.: MCP_ALLOWED_HOSTS=memory-server.tailXXXX.ts.net
-PUBLIC_HOSTS = [h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
-
 mcp = MCPServer("memory-server")
 
 # One connection per server process. The SDK serves all sessions of this
@@ -147,7 +133,7 @@ def _db() -> sqlite3.Connection:
             check_same_thread=False,  # SDK dispatches calls across threads; _SERVER_LOCK serializes
         )
         try:
-            _initialize_db(conn)
+            storage.initialize(conn, SYNCHRONOUS)
         except BaseException:
             conn.close()
             raise
@@ -155,171 +141,70 @@ def _db() -> sqlite3.Connection:
     return _conn
 
 
-def _initialize_db(conn: sqlite3.Connection) -> None:
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL;")      # readers don't block the writer
-    conn.execute("PRAGMA synchronous=NORMAL;")    # WAL-safe durability trade-off
-    conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS facts (
-                key           TEXT PRIMARY KEY,
-                value         TEXT NOT NULL,
-                source_client TEXT NOT NULL,
-                updated_at    TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS events (
-                id        INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                client_id TEXT NOT NULL,
-                action    TEXT NOT NULL,   -- 'set' | 'get' | 'delete' | 'search'
-                key       TEXT,
-                value     TEXT
-            );
-
-            CREATE TABLE IF NOT EXISTS fact_embeddings (
-                key       TEXT PRIMARY KEY,   -- mirrors facts.key
-                embedding BLOB NOT NULL       -- normalized float32 vector (384 dims)
-            );
-            """
-    )
-    audit.migrate(conn)
-
-
-# ---------------------------------------------------------------------- #
-# Phase 4A: semantic recall                                              #
-# ---------------------------------------------------------------------- #
-# all-MiniLM-L6-v2, 384-dim embeddings, ~80MB, CPU-friendly. The model is
-# loaded LAZILY (first embed call) and kept as a singleton: loading at
-# server start would tax every client spawn (~10s import + ~16s model load
-# + ~500MB RAM), and each MCP client spawns its own server subprocess.
-# With the cache warm, first embed is a few seconds and subsequent ones
-# are milliseconds -- never per-call loading, per the design note.
-_model = None
-_model_lock = threading.Lock()  # lazy load must be single-flight (preload thread vs first call)
-
-
-def _hf_model_cached(model_id: str) -> bool:
-    """Is model_id already in the local HF cache? Pure filesystem check.
-
-    Deliberately does NOT import huggingface_hub: that library (and
-    transformers) snapshot HF_HUB_OFFLINE from the environment at import
-    time, so setting the variable after any HF-family import silently does
-    nothing -- which is exactly the trap this check originally fell into
-    (the env was set, but only after the import, so the model load went
-    online anyway and hung on network freshness checks).
-    """
-    home = Path.home() / ".cache" / "huggingface"
-    hub = Path(os.environ.get("HF_HUB_CACHE",
-               Path(os.environ.get("HF_HOME", home)) / "hub"))
-    snapshots = hub / ("models--" + model_id.replace("/", "--")) / "snapshots"
-    try:
-        return snapshots.is_dir() and any(snapshots.iterdir())
-    except OSError:
-        return False
-
-
-def _embed(texts: list[str]):
-    """Embed texts as normalized float32 numpy vectors (cosine-ready)."""
-    global _model
-    if _model is None:
-        with _model_lock:
-            if _model is None:  # double-checked: only one thread ever loads
-                if not EMBEDDINGS_ENABLED:
-                    raise ToolError(
-                        "semantic search is disabled on this server (MCP_EMBEDDINGS=off); "
-                        "use memory_list with a key prefix instead"
-                    )
-                # Offline-vs-online decided BEFORE any HF import (see
-                # _hf_model_cached): cached -> force offline so network
-                # freshness checks can never hang a tool call (observed);
-                # not cached -> stay online so the one-time download works
-                # (fresh clones, CI).
-                if _hf_model_cached("sentence-transformers/all-MiniLM-L6-v2"):
-                    os.environ.setdefault("HF_HUB_OFFLINE", "1")
-                    print("model cache detected: HF_HUB_OFFLINE=1", file=sys.stderr)
-                from sentence_transformers import SentenceTransformer  # deferred heavy import
-
-                _model = SentenceTransformer("all-MiniLM-L6-v2")
-    # show_progress_bar=False: ST's default tqdm bar writes to stderr on
-    # every encode. Harmless in a terminal, but a real host captures stderr
-    # through a pipe -- enough per-call refreshes fill the OS pipe buffer
-    # (~64KB) and BLOCK the server mid-encode (the Phase 3 wedge, caused
-    # this time by the embedding path itself).
-    vectors = _model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    return vectors.astype("float32")
-
-
-def _client_id(ctx: Context, claimed: str | None = None) -> str:
+def _client_id(ctx: Context, claimed: str | None = None, write: bool = False) -> str:
     if TRANSPORT == "http" and AUTH_CLIENTS_FILE:
         request = ctx.request_context.request
         user = request.scope.get("user") if request is not None else None
         if not isinstance(user, AuthenticatedUser):
             raise ToolError("authenticated client identity unavailable")
+        required = "write" if write else "read"
+        if required not in user.scopes:
+            raise ToolError(f"credential requires {required} scope")
         return user.access_token.client_id
     return claimed or DEFAULT_CLIENT_ID
 
 
-def _log(client_id: str, action: str, key: str | None, value: str | None) -> None:
-    audit.append(_db(), _now(), client_id, action, key, value)
+def _log(client_id: str, action: str, key: str | None, value: str | None,
+         timestamp: str | None = None, embedding: bytes | None = None) -> None:
+    audit.append(_db(), timestamp or _now(), client_id, action, key, value, embedding)
 
 
 def _tool_guard(fn):
-    """Two jobs:
-
-    1. Trace every tool call (args, outcome, exceptions) to the file named
-       by MCP_DEBUG_LOG when set -- our forensic recorder for client-side
-       sessions whose stderr we can't see (e.g. Claude Desktop).
-    2. mcp 2.x flattens arbitrary tool exceptions to 'Error executing tool
-       <name>', losing the message entirely. ToolError survives -- the SDK
-       prefixes it ('Error executing tool <name>: ...') but keeps the
-       detail. Translate lock errors into ToolError so clients can read
-       and act on them.
-    """
-
+    """Record full tool latency and preserve actionable SQLite errors."""
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
-        debug_path = os.environ.get("MCP_DEBUG_LOG")
-        if debug_path:
-            logged_kwargs = {key: value for key, value in kwargs.items() if key != "ctx"}
-        start = time.time()
+        start = time.perf_counter()
+        error = None
         try:
-            with _SERVER_LOCK:  # serialize all db access across SDK worker threads
-                result = fn(*args, **kwargs)
-            if debug_path:
-                with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"{_now()} OK   {fn.__name__} args={args} kwargs={logged_kwargs} "
-                            f"({time.time() - start:.3f}s) -> {str(result)[:200]}\n")
-            return result
-        except sqlite3.OperationalError as exc:  # outside the lock: nothing db-related to serialize
-            if debug_path:
-                import traceback
-                with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={logged_kwargs} "
-                            f"({time.time() - start:.3f}s) {type(exc).__name__}: {exc}\n")
+            ctx = kwargs.get("ctx")
+            if ctx is not None:
+                _client_id(ctx)
+            return fn(*args, **kwargs)
+        except sqlite3.OperationalError as exc:
+            error = exc
             if "locked" in str(exc) or "busy" in str(exc):
                 raise ToolError(
                     f"database is locked (busy_timeout={BUSY_TIMEOUT_MS}ms): {exc}. "
                     "Another client holds the write lock; retry with backoff."
                 ) from None
             raise
-        except BaseException as exc:  # record everything, then surface it
-            if debug_path:
-                import traceback
-                with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(f"{_now()} FAIL {fn.__name__} args={args} kwargs={logged_kwargs} "
-                            f"({time.time() - start:.3f}s) {type(exc).__name__}: {exc}\n"
-                            f"{''.join(traceback.format_exc())}\n")
+        except BaseException as exc:
+            error = exc
             raise
-
+        finally:
+            METRICS.observe("tool", time.perf_counter() - start)
+            if error:
+                METRICS.add("tool_failures_total")
+            debug_event(fn.__name__, start, error)
     return wrapper
 
 
-@_tool_guard
+def _db_guard(fn):
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        with _SERVER_LOCK:
+            METRICS.observe("lock_wait", time.perf_counter() - start)
+            return fn(*args, **kwargs)
+    return wrapper
+
+
+@_db_guard
 def _guarded_set(
     key: str,
     value: str,
     cid: str,
+    embedding: bytes | None,
     expected_value: str | None = None,
     require_absent: bool = False,
 ) -> str:
@@ -327,10 +212,8 @@ def _guarded_set(
         raise ToolError("require_absent and expected_value are mutually exclusive")
     _validate(key, value)
     db = _db()
-    # Embed BEFORE opening the write transaction: the first call loads the
-    # model (~seconds) and must not hold SQLite's write lock while doing it.
-    embedding = _embed([f"{key}: {value}"])[0].tobytes() if EMBEDDINGS_ENABLED else None
 
+    timestamp = _now()
     cas_failure: str | None = None
     with db:  # transaction: fact update + event insert (+ embedding) commit together
         if require_absent:
@@ -340,7 +223,7 @@ def _guarded_set(
             try:
                 db.execute(
                     "INSERT INTO facts (key, value, source_client, updated_at) VALUES (?, ?, ?, ?)",
-                    (key, value, cid, _now()),
+                    (key, value, cid, timestamp),
                 )
             except sqlite3.IntegrityError:
                 current = db.execute("SELECT value FROM facts WHERE key = ?", (key,)).fetchone()
@@ -357,7 +240,7 @@ def _guarded_set(
             cur = db.execute(
                 "UPDATE facts SET value=?, source_client=?, updated_at=? "
                 "WHERE key=? AND value=?",
-                (value, cid, _now(), key, expected_value),
+                (value, cid, timestamp, key, expected_value),
             )
             if cur.rowcount == 0:
                 current = db.execute("SELECT value FROM facts WHERE key = ?", (key,)).fetchone()
@@ -368,7 +251,7 @@ def _guarded_set(
                 "INSERT INTO facts (key, value, source_client, updated_at) VALUES (?, ?, ?, ?) "
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value, "
                 "source_client=excluded.source_client, updated_at=excluded.updated_at",
-                (key, value, cid, _now()),
+                (key, value, cid, timestamp),
             )
 
         if cas_failure is None:
@@ -378,7 +261,9 @@ def _guarded_set(
                     "ON CONFLICT(key) DO UPDATE SET embedding=excluded.embedding",
                     (key, embedding),
                 )
-            _log(cid, "set", key, value)
+            else:
+                db.execute("DELETE FROM fact_embeddings WHERE key=?", (key,))
+            _log(cid, "set", key, value, timestamp, embedding)
         else:
             _log(cid, "cas_fail", key, cas_failure)
 
@@ -388,6 +273,7 @@ def _guarded_set(
 
 
 @mcp.tool()
+@_tool_guard
 def memory_set(
     key: str,
     value: str,
@@ -410,14 +296,19 @@ def memory_set(
     Every attempt is logged -- successful writes as 'set', failed CAS/
     create-only attempts as 'cas_fail' -- so see memory_history to debug
     who tried to write what, and who lost."""
-    # Thin facade: the guarded implementation does the work, so the guard
-    # (and its MCP_DEBUG_LOG entry) wraps each call exactly ONCE. Wrapping
-    # both layers double-logged every set -- caught in code review.
-    return _guarded_set(key, value, _client_id(ctx, client_id), expected_value, require_absent)
+    # Prepare the vector before entering the serialized database phase.
+    cid = _client_id(ctx, client_id, write=True)
+    _validate(key, value)
+    if require_absent and expected_value is not None:
+        raise ToolError("require_absent and expected_value are mutually exclusive")
+    # Model work is serialized by its own lock and does not block DB reads.
+    embedding = embeddings._embed([f"{key}: {value}"])[0].tobytes() if EMBEDDINGS_ENABLED else None
+    return _guarded_set(key, value, cid, embedding, expected_value, require_absent)
 
 
 @mcp.tool()
 @_tool_guard
+@_db_guard
 def memory_get(key: str, ctx: Context, include_events: bool = False) -> str:
     """Fetch a fact by exact key. With include_events=True, appends the
     key's full write history from the events log."""
@@ -449,7 +340,8 @@ def memory_get(key: str, ctx: Context, include_events: bool = False) -> str:
 
 @mcp.tool()
 @_tool_guard
-def memory_list(prefix: str = "") -> str:
+@_db_guard
+def memory_list(ctx: Context, prefix: str = "") -> str:
     """List facts whose key starts with `prefix` (all facts if empty)."""
     # Escape LIKE wildcards in the prefix, and tell SQLite which escape
     # character we used: without ESCAPE '\', "\%" is just backslash-percent
@@ -468,6 +360,7 @@ def memory_list(prefix: str = "") -> str:
 
 @mcp.tool()
 @_tool_guard
+@_db_guard
 def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
     """Find facts by MEANING, not key: embeds the query and returns the
     top_k most similar facts by cosine similarity. Works with different
@@ -484,7 +377,7 @@ def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
     ).fetchall()
     if not rows:
         return "(no searchable facts stored yet)"
-    query_vec = _embed([query])[0]
+    query_vec = embeddings._embed([query])[0]
     scored = []
     for row in rows:
         vec = np.frombuffer(row["embedding"], dtype="float32")
@@ -504,7 +397,8 @@ def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
 
 @mcp.tool()
 @_tool_guard
-def memory_history(key: str, include_reads: bool = False) -> str:
+@_db_guard
+def memory_history(key: str, ctx: Context, include_reads: bool = False) -> str:
     """Full audit trail for one key: every set/delete/cas_fail event in
     order, with attribution -- who wrote what (and who tried and lost a
     CAS/create-only race), when. include_reads=True also shows every get
@@ -526,9 +420,10 @@ def memory_history(key: str, include_reads: bool = False) -> str:
 
 @mcp.tool()
 @_tool_guard
+@_db_guard
 def memory_delete(key: str, ctx: Context, client_id: str | None = None) -> str:
     """Delete a fact by key. No-op if the key doesn't exist (still logged)."""
-    cid = _client_id(ctx, client_id)
+    cid = _client_id(ctx, client_id, write=True)
     _validate(key)
     db = _db()
     with db:
@@ -548,139 +443,35 @@ if os.environ.get("MCP_ENABLE_DEMO_TOOLS") == "1":
 
     @mcp.tool()
     @_tool_guard
+    @_db_guard
     def lock_hold(ctx: Context, seconds: float = 2.0) -> str:
         """[demo] Hold the SQLite write lock for `seconds`, then commit."""
-        cid = _client_id(ctx)
+        cid = _client_id(ctx, write=True)
         with _db():
             _log(cid, "demo-lock-hold", None, None)
             time.sleep(seconds)
         return f"held the write lock for {seconds}s (client {cid!r})"
 
 
-def _maybe_preload_model() -> None:
-    """With MCP_PRELOAD_MODEL=1, load the embedding model in a background
-    thread at startup: the server still starts instantly, but the model is
-    (usually) ready by the first real tool call, so clients never see the
-    ~25s cold load on their first memory_set."""
-    if not (EMBEDDINGS_ENABLED and os.environ.get("MCP_PRELOAD_MODEL") == "1"):
-        return
-
-    def _load():
-        try:
-            _embed(["preload"])
-            print("embedding model preloaded", file=sys.stderr)
-        except Exception as exc:  # preload is best-effort; lazy load still works
-            print(f"embedding model preload failed: {exc}", file=sys.stderr)
-
-    threading.Thread(target=_load, daemon=True).start()
-
-
-def _load_client_tokens(path: str) -> dict[bytes, str]:
-    clients = json.loads(Path(path).read_text(encoding="utf-8"))
-    if not isinstance(clients, dict) or not clients:
-        raise ValueError("expected a nonempty JSON object mapping client IDs to tokens")
-    credentials = {}
-    for client_id, token in clients.items():
-        if not re.fullmatch(r"[a-zA-Z0-9._-]{1,64}", client_id):
-            raise ValueError("client IDs must be 1-64 ASCII letters, digits, dots, underscores or hyphens")
-        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9._~+/=-]{32,}", token):
-            raise ValueError("tokens must have at least 32 bearer-token characters")
-        header = f"Bearer {token}".encode("ascii")
-        if header in credentials:
-            raise ValueError("each client must have a unique token")
-        credentials[header] = client_id
-    return credentials
-
-
-def _bearer_auth_asgi(app, credentials: dict[bytes, str | None]):
-    """Wrap the streamable-HTTP ASGI app with a bearer-token check.
-
-    Pure ASGI middleware (no Starlette import needed): rejects unauthenticated
-    requests BEFORE the MCP layer parses a body or touches the db. Response
-    body is a JSON-RPC error object so even protocol-pure clients get an
-    interpretable failure. See README.md (Phase 4C, auth design) for what
-    this does and does not claim. Compares with hmac.compare_digest
-    (timing-attack safe); a missing
-    header must not leak whether a token is even configured.
-    """
-
-    async def _auth_middleware(scope, receive, send):
-        if scope["type"] != "http":
-            await app(scope, receive, send)
-            return
-        headers = [value for key, value in scope.get("headers", []) if key.lower() == b"authorization"]
-        matches = [client_id for header, client_id in credentials.items()
-                   if len(headers) == 1 and hmac.compare_digest(headers[0], header)]
-        if not matches:
-            body = json.dumps({
-                "jsonrpc": "2.0",
-                "id": None,
-                "error": {"code": -32001, "message": "Unauthorized: missing or invalid bearer token"},
-            }).encode("utf-8")
-            await send({"type": "http.response.start", "status": 401,
-                        "headers": [(b"content-type", b"application/json"),
-                                    (b"www-authenticate", b"Bearer"),
-                                    (b"content-length", str(len(body)).encode("ascii"))]})
-            await send({"type": "http.response.body", "body": body})
-            return
-        if (client_id := matches[0]) is not None:
-            # The SDK binds MCP sessions to this principal and passes the
-            # request scope into each tool's injected Context.
-            user = AuthenticatedUser(AccessToken(token=headers[0][7:].decode("ascii"),
-                                                 client_id=client_id, scopes=[]))
-            scope = {**scope, "user": user}
-        await app(scope, receive, send)
-
-    return _auth_middleware
-
-
-def _run_http() -> None:
-    """Serve streamable-HTTP with the auth wrapper. Fails closed: no token,
-    no server (README.md, Phase 4C). json_response=True returns plain JSON bodies
-    instead of SSE streams, which is what a hand-rolled client wants to
-    parse. DNS-rebinding protection stays ON; MCP_ALLOWED_HOSTS extends its
-    allow-list to whatever public hostname actually fronts this server
-    (Tailscale Funnel, a Cloudflare Tunnel, a real domain) -- see the
-    PUBLIC_HOSTS comment above for why that's required, not optional."""
-    if bool(AUTH_TOKEN) == bool(AUTH_CLIENTS_FILE):
-        print("refusing to start: MCP_TRANSPORT=http requires exactly one of "
-              "MCP_AUTH_TOKEN or MCP_AUTH_CLIENTS_FILE", file=sys.stderr)
-        sys.exit(2)
-    try:
-        credentials = (_load_client_tokens(AUTH_CLIENTS_FILE) if AUTH_CLIENTS_FILE
-                       else {f"Bearer {AUTH_TOKEN}".encode("latin-1"): None})
-    except (OSError, ValueError) as exc:
-        print(f"refusing to start: invalid HTTP auth configuration ({exc})", file=sys.stderr)
-        sys.exit(2)
-    import uvicorn  # already an mcp dependency
-    from mcp.server.transport_security import TransportSecuritySettings
-
-    security = TransportSecuritySettings(
-        enable_dns_rebinding_protection=True,
-        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *PUBLIC_HOSTS],
-        allowed_origins=[
-            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
-            *(f"https://{h}" for h in PUBLIC_HOSTS),
-        ],
-    )
-    app = mcp.streamable_http_app(json_response=True, transport_security=security)
-    wrapped = _bearer_auth_asgi(app, credentials)
-    print(f"http transport: http://{HTTP_HOST}:{HTTP_PORT}/mcp "
-          f"(bearer token required, json mode, allowed hosts: "
-          f"127.0.0.1/localhost/::1{', ' + ', '.join(PUBLIC_HOSTS) if PUBLIC_HOSTS else ''})",
-          file=sys.stderr)
-    uvicorn.run(wrapped, host=HTTP_HOST, port=HTTP_PORT, log_level="warning")
+def _operational_state() -> dict:
+    with _SERVER_LOCK:
+        db = _db()
+        count = db.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        return {"chain_length": count, "sqlite_synchronous": db.execute("PRAGMA synchronous").fetchone()[0]}
 
 
 if __name__ == "__main__":
+    if SYNCHRONOUS not in ("NORMAL", "FULL"):
+        print("MCP_SQLITE_SYNCHRONOUS must be NORMAL or FULL", file=sys.stderr)
+        sys.exit(2)
     # Avoid stray print()s: stdout is the protocol channel (stdio mode).
     print(
         f"memory server: db={os.path.abspath(DB_PATH)} busy_timeout={BUSY_TIMEOUT_MS}ms "
         f"client_id={DEFAULT_CLIENT_ID!r} transport={TRANSPORT}",
         file=sys.stderr,
     )
-    _maybe_preload_model()
+    embeddings._maybe_preload_model()
     if TRANSPORT == "http":
-        _run_http()
+        http_transport.run(mcp, _operational_state, METRICS)
     else:
         mcp.run(transport="stdio")

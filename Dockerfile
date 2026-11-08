@@ -5,7 +5,7 @@
 # A stdio MCP server in Docker is useful when the *host* launches it as a
 # subprocess, e.g. claude_desktop_config.json:
 #   "command": "docker",
-#   "args": ["run", "--rm", "-i", "-v", "C:\\...\\memory.db:/data/memory.db",
+#   "args": ["run", "--rm", "-i", "-v", "mcp-memory-data:/data",
 #            "mcp-memory-bridge", "python", "server/memory_server.py", "/data/memory.db"]
 FROM python:3.13-slim
 
@@ -15,7 +15,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir mcp==2.2.0 numpy==2.2.6
 
-COPY server/memory_server.py server/audit.py server/
+COPY server/*.py server/
+COPY tools/memory_admin.py tools/memory_admin.py
+
+RUN groupadd --gid 10001 memory \
+    && useradd --uid 10001 --gid memory --no-create-home memory \
+    && mkdir -p /data \
+    && chown memory:memory /data
+USER 10001:10001
 
 ENV MCP_EMBEDDINGS=off
 # stdout is the JSON-RPC protocol channel; Python must not buffer it or the

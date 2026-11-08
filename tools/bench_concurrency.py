@@ -1,7 +1,10 @@
 """Measure warm write latency for concurrent stdio MCP clients sharing SQLite."""
 
 import argparse
+import json
 import math
+import platform
+import sqlite3
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -26,6 +29,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--clients", type=_positive, default=8)
     parser.add_argument("--writes", type=_positive, default=100, help="timed writes per client")
+    parser.add_argument("--synchronous", choices=["NORMAL", "FULL"], default="NORMAL")
+    parser.add_argument("--server", type=Path, default=ROOT / "server" / "memory_server.py")
+    parser.add_argument("--json", action="store_true", help="emit one machine-readable result")
     args = parser.parse_args()
     barrier = Barrier(args.clients)
 
@@ -53,9 +59,10 @@ def main() -> int:
         clients = []
         for index in range(args.clients):
             client = RawMCPClient(
-                [sys.executable, str(ROOT / "server" / "memory_server.py"), str(Path(temp) / "bench.db")],
+                [sys.executable, str(args.server.resolve()), str(Path(temp) / "bench.db")],
                 env={"MCP_TRANSPORT": "stdio", "MCP_EMBEDDINGS": "off",
-                     "MCP_SQLITE_BUSY_TIMEOUT": "5000", "MCP_CLIENT_ID": f"bench-{index}"},
+                     "MCP_SQLITE_BUSY_TIMEOUT": "5000", "MCP_CLIENT_ID": f"bench-{index}",
+                     "MCP_SQLITE_SYNCHRONOUS": args.synchronous},
             )
             stack.callback(client.close)
             client.initialize()
@@ -69,11 +76,20 @@ def main() -> int:
     samples = sorted(sample for batch, *_ in results for sample in batch)
     failures = sum(result[1] for result in results)
     elapsed = max(result[3] for result in results) - min(result[2] for result in results)
-    print(f"{args.clients} clients x {args.writes} writes | {len(samples)} succeeded | "
+    p50 = samples[math.ceil(0.50 * len(samples)) - 1] if samples else None
+    p99 = samples[math.ceil(0.99 * len(samples)) - 1] if samples else None
+    if args.json:
+        print(json.dumps({
+            "clients": args.clients, "writes_per_client": args.writes, "synchronous": args.synchronous,
+            "succeeded": len(samples), "failed": failures, "writes_per_second": round(len(samples) / elapsed, 2),
+            "p50_ms": round(p50, 3) if samples else None, "p99_ms": round(p99, 3) if samples else None,
+            "python": platform.python_version(), "sqlite": sqlite3.sqlite_version,
+            "platform": platform.platform(),
+        }))
+        return int(bool(failures))
+    print(f"{args.clients} clients x {args.writes} writes | {args.synchronous} | {len(samples)} succeeded | "
           f"{failures} failed | {len(samples) / elapsed:.1f} successful writes/s")
     if samples:
-        p50 = samples[math.ceil(0.50 * len(samples)) - 1]
-        p99 = samples[math.ceil(0.99 * len(samples)) - 1]
         print(f"successful write latency | p50={p50:.2f} ms | p99={p99:.2f} ms")
     if failures:
         print(f"first failure: {next(result[4] for result in results if result[1])}", file=sys.stderr)

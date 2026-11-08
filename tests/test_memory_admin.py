@@ -32,7 +32,7 @@ def test_legacy_migration_backup_restore_and_verification(make_client, tmp_path)
     assert not live.call_tool("memory_set", {"key": "snapshot", "value": "before"}).get("isError")
     saved = _admin("backup", db, archive)
     assert saved.returncode == 0, saved.stderr
-    assert "events=2" in saved.stdout
+    assert "events=3" in saved.stdout
     head = saved.stdout.strip().split("head=")[1]
     assert not live.call_tool("memory_set", {"key": "snapshot", "value": "after"}).get("isError")
     recovered = _admin("restore", archive, restored)
@@ -45,7 +45,7 @@ def test_legacy_migration_backup_restore_and_verification(make_client, tmp_path)
     assert "snapshot = before" in reader.call_tool("memory_get", {"key": "snapshot"})["content"][0]["text"]
     assert "legacy" in reader.call_tool("memory_history", {"key": "old"})["content"][0]["text"]
     with closing(sqlite3.connect(restored)) as conn, conn:
-        conn.execute("DELETE FROM events WHERE id=8")
+        conn.execute("DELETE FROM events WHERE id=(SELECT MAX(id) FROM events)")
     assert _admin("verify", restored).returncode == 0
     assert "head mismatch" in _admin("verify", restored, "--expected-head", head).stderr
     with closing(sqlite3.connect(restored)) as conn, conn:

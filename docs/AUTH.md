@@ -8,44 +8,64 @@ listens on a socket, "who is allowed to call this" becomes a real question.
 
 ## Configure per-client credentials
 
-Set `MCP_TRANSPORT=http` and `MCP_AUTH_CLIENTS_FILE` to the absolute path
-of a private JSON file. Unset `MCP_AUTH_TOKEN` in this mode. The server
-requires exactly one credential source at startup.
+Set `MCP_TRANSPORT=http` and `MCP_AUTH_CLIENTS_FILE` to a private JSON file.
+Select exactly one credential source at startup.
+
+```sh
+python tools/memory_admin.py token --scope read-write
+python tools/memory_admin.py token --scope read
+```
+
+Each invocation prints a random bearer token and its credential object. Give the
+token to its client and copy the credential object into the configuration under
+that client's ID.
 
 ```json
 {
-  "claude-desktop": "<unique-generated-token>",
-  "ci-agent": "<another-unique-generated-token>"
+  "claude-desktop": {
+    "token_sha256": "<generated SHA-256 digest>",
+    "scopes": ["read", "write"]
+  },
+  "reader-agent": {
+    "token_sha256": "<another generated SHA-256 digest>",
+    "scopes": ["read"]
+  }
 }
 ```
 
-Generate each token independently with
-`python -c "import secrets; print(secrets.token_urlsafe(32))"`.
-Client IDs use 1 to 64 ASCII letters, digits, dots, underscores, or
-hyphens. Keep the file outside the repository and restrict access to the
-server account. For the systemd deployment, place it in `/opt/mcp-memory`
-and update `/opt/mcp-memory/env` before restarting the service.
+Client IDs use 1 to 64 ASCII letters, digits, dots, underscores, or hyphens.
+Each digest must be unique. Keep the configuration outside the repository and
+restrict writes to the operator. For systemd, place it in `/opt/mcp-memory`
+and set its path in `/opt/mcp-memory/env`. The service account needs read access.
 
-Give each client only its own token. Every request carries it in the
-`Authorization` header. The server checks the credential before passing
-the request to MCP and binds the session to the configured identity.
-Facts and audit records use that identity even when tool arguments
-include a different `client_id`. A valid credential grants access to
-the shared store. Attribution identifies the credential holder, and
-anyone who obtains that credential can act as its client.
+The server reads a complete configuration on each HTTP request. Publish changes
+by replacing the file atomically. Removing a client revokes its next request,
+including requests on an existing MCP session. Token rotation and scope changes
+also apply without a restart. A malformed or unreadable configuration produces
+503 until repaired. An empty object revokes every per-client credential.
 
-To revoke a client, remove its entry and restart the server. To rotate
-its token, replace the value and restart. The file loads at startup and
-the restart ends active sessions, so remaining clients must reconnect.
-Serve remote traffic through HTTPS and keep the HTTP listener on
-loopback behind the TLS proxy.
+Every request carries `Authorization: Bearer <token>`. The server hashes the
+supplied token and compares digests in constant time. It assigns the configured
+identity to fact sources and audit records, overriding `client_id` arguments.
+The SDK binds sessions to that identity. A client cannot reuse another identity's
+session ID. Scope changes are checked using the current request's credential.
+
+The read scope permits get, list, history, and semantic search. Read/write
+credentials additionally permit set, delete, and the optional lock demo.
+Read operations can still append audit events. All clients share one namespace.
+
+Keep remote traffic behind HTTPS and bind the HTTP listener to loopback behind
+the TLS proxy. Failed authentication attempts increment a metric and emit a
+generic stderr record. Tokens and memory contents are omitted from those logs.
+Authenticated operational endpoints retain Host and Origin checks.
 
 ## Shared-token compatibility
 
 Existing HTTP deployments can continue using `MCP_AUTH_TOKEN` alone.
 In that mode, clients share one credential and attribution comes from
 the tool arguments or `MCP_CLIENT_ID`. Stdio also uses self-reported
-attribution.
+attribution. Legacy per-client plaintext token entries remain readable for
+existing deployments. New configurations should use the generated hash entries.
 
 ## Header walkthrough (what each one is for)
 
