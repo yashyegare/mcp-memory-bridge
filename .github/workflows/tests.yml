@@ -74,5 +74,9 @@ jobs:
       - name: Smoke test (initialize handshake)
         run: |
           printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0.0.0"}}}' \
-            | docker run --rm -i -v "$PWD/smoke.db:/data/memory.db" mcp-memory-bridge:ci \
+            | docker run --rm -i mcp-memory-bridge:ci \
             | grep -q '"serverInfo"'
+      - name: Smoke test storage as non-root
+        run: |
+          docker run --rm --entrypoint python mcp-memory-bridge:ci -c \
+            'import os, sqlite3, sys; sys.path.insert(0, "/app/server"); import storage, audit; assert os.geteuid() != 0; db = sqlite3.connect("/data/smoke.db"); storage.initialize(db, "FULL"); assert audit.verify(db, replay=True)[0] == 1'

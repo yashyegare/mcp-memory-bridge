@@ -7,8 +7,10 @@ echo. No embedding model here (MCP_EMBEDDINGS=off): these tests cover
 transport and auth, not semantics.
 """
 
+import hashlib
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -44,8 +46,12 @@ def _serve_http(db, **auth_env):
         "MCP_EMBEDDINGS": "off",
         **auth_env,
     }
+    pid_file = db.with_suffix(".pid")
+    program = ("import os,sys,runpy; from pathlib import Path; "
+               "Path(sys.argv[1]).write_text(str(os.getpid())); sys.argv=sys.argv[2:]; "
+               "sys.path.insert(0, str(Path(sys.argv[0]).parent)); runpy.run_path(sys.argv[0], run_name='__main__')")
     proc = subprocess.Popen(
-        [sys.executable, MEMORY_SERVER, str(db)],
+        [sys.executable, "-c", program, str(pid_file), MEMORY_SERVER, str(db)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
     )
     url = f"http://127.0.0.1:{port}/mcp"
@@ -65,7 +71,8 @@ def _serve_http(db, **auth_env):
     try:
         yield url
     finally:
-        proc.terminate()
+        if pid_file.exists() and proc.poll() is None:
+            os.kill(int(pid_file.read_text()), signal.SIGTERM)
         proc.wait(timeout=5)
 
 
@@ -202,3 +209,81 @@ def test_per_client_tokens_bind_sessions_and_audit_identity(tmp_path):
         bob = RawHTTPMCPClient(url, bob_token)
         bob.initialize()
         bob.close()
+
+
+def test_hashed_tokens_reload_scopes_and_revoke_existing_sessions(tmp_path):
+    config = tmp_path / "hashed.json"
+    db = tmp_path / "hashed.db"
+    alice_token, bob_token = "a" * 43, "b" * 43
+
+    def save(alice_scopes, include_bob=True):
+        clients = {"alice": {"token_sha256": hashlib.sha256(alice_token.encode()).hexdigest(),
+                             "scopes": alice_scopes}}
+        if include_bob:
+            clients["bob"] = {"token_sha256": hashlib.sha256(bob_token.encode()).hexdigest(),
+                              "scopes": ["read", "write"]}
+        staged = config.with_suffix(".new")
+        staged.write_text(json.dumps(clients), encoding="utf-8")
+        staged.replace(config)
+
+    save(["read"])
+    with _serve_http(db, MCP_AUTH_CLIENTS_FILE=str(config)) as url:
+        alice, bob = RawHTTPMCPClient(url, alice_token), RawHTTPMCPClient(url, bob_token)
+        alice.initialize()
+        bob.initialize()
+        assert not bob.call_tool("memory_set", {"key": "scoped", "value": "private-value"}).get("isError")
+        assert "private-value" in alice.call_tool("memory_get", {"key": "scoped"})["content"][0]["text"]
+        for tool, arguments in [
+            ("memory_set", {"key": "scoped", "value": "forbidden"}),
+            ("memory_delete", {"key": "scoped"}),
+        ]:
+            result = alice.call_tool(tool, arguments)
+            assert result["isError"]
+            assert "write scope" in result["content"][0]["text"]
+        save(["read", "write"])
+        assert not alice.call_tool("memory_set", {"key": "scoped", "value": "allowed"}).get("isError")
+        save(["read"])
+        assert alice.call_tool("memory_delete", {"key": "scoped"})["isError"]
+        save(["read"], include_bob=False)
+        with pytest.raises(MCPError, match="401"):
+            bob.list_tools()
+
+        def get(path, token=alice_token, **extra):
+            req = urllib.request.Request(url.removesuffix("/mcp") + path,
+                                         headers={"Authorization": f"Bearer {token}", **extra})
+            return urllib.request.urlopen(req, timeout=10)
+
+        with get("/healthz") as response:
+            assert json.load(response) == {"status": "ok"}
+        with get("/metrics") as response:
+            metrics = response.read().decode()
+            assert "memory_auth_failures_total 1" in metrics
+            assert "memory_lock_wait_seconds_count" in metrics
+            assert "memory_chain_length" in metrics
+            assert "private-value" not in metrics
+        with pytest.raises(urllib.error.HTTPError) as error:
+            get("/healthz", Host="evil.example")
+        assert error.value.code == 421
+        config.write_text("{invalid json", encoding="utf-8")
+        with pytest.raises(ConnectionError, match="503"):
+            alice.list_tools()
+        save(["read"])
+        assert alice.list_tools()
+        alice.close()
+
+
+def test_debug_log_omits_values_and_failure_details(tmp_path):
+    db, debug = tmp_path / "debug.db", tmp_path / "debug.jsonl"
+    with _serve_http(db, MCP_AUTH_TOKEN=TOKEN, MCP_DEBUG_LOG=str(debug)) as url:
+        client = RawHTTPMCPClient(url, TOKEN)
+        client.initialize()
+        secret = "sensitive-fact-348792"
+        client.call_tool("memory_set", {"key": "secret-key", "value": secret})
+        client.call_tool("memory_get", {"key": "secret-key"})
+        client.call_tool("memory_set", {"key": "secret-key", "value": "new", "expected_value": "wrong"})
+        client.close()
+    contents = debug.read_text(encoding="utf-8")
+    assert secret not in contents and "secret-key" not in contents and TOKEN not in contents
+    events = [json.loads(line) for line in contents.splitlines()]
+    assert len(events) == 3
+    assert events[-1]["outcome"] == "ToolError"

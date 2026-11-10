@@ -89,11 +89,12 @@ launching a container as its stdio subprocess:
 
 ```json
 { "command": "docker",
-  "args": ["run", "--rm", "-i", "-v", "C:\\...\\memory.db:/data/memory.db",
+  "args": ["run", "--rm", "-i", "-v", "mcp-memory-data:/data",
             "mcp-memory-bridge", "python", "server/memory_server.py", "/data/memory.db"] }
 ```
 
-CI builds the image and smoke-tests the handshake through it on every push.
+The named volume persists the database and its WAL files. The image runs as
+UID/GID 10001. CI builds the image and tests both the handshake and storage.
 
 ## Project layout
 
@@ -103,7 +104,18 @@ client/
 server/
   test_server.py       # trivial SDK server (echo, add) — Phase 1 target
   memory_server.py     # SQLite-backed shared memory server — Phases 2/3/4
+  audit.py             # versioned hash chain and replay
+  checkpoints.py       # authenticated external checkpoints
+  recovery.py          # online full backups and event incrementals
+  storage.py           # schema and SQLite connection configuration
+  embeddings.py        # lazy embedding model and its lock
+  http_transport.py    # authentication, reload, operational endpoints
+  telemetry.py         # process counters and redacted debug records
 tools/
+  memory_admin.py      # verify, checkpoint, back up, restore, plan retention
+  crash_consistency.py # repeated forced termination and recovery checks
+  bench_concurrency.py # stdio write throughput and latency
+  bench_mixed_http.py  # embedded writes and unlogged HTTP reads
   stress_concurrent.py # multi-client write race harness
   live_hammer.py       # timed hammer for the live Claude Desktop race
   lock_demo.py         # deterministic lock-contention demo
@@ -391,6 +403,7 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 | db argv / `MCP_MEMORY_DB` | which SQLite file to share |
 | `MCP_CLIENT_ID` | attribution for this client's writes and log entries |
 | `MCP_SQLITE_BUSY_TIMEOUT` | ms a write waits for the lock (default 5000; `0` = fail fast) |
+| `MCP_SQLITE_SYNCHRONOUS` | `NORMAL` (default) or `FULL`, applied to every server connection |
 | `MCP_EMBEDDINGS` | `off` = lean server, no ML stack |
 | `MCP_PRELOAD_MODEL` | `1` = load the embedding model at spawn instead of first use |
 | `MCP_LOG_READS` | `off` = `memory_get` becomes truly read-only (see design notes) |
@@ -398,65 +411,70 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 | `MCP_TRANSPORT` | `stdio` (default, one subprocess per client) or `http` |
 | `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | bind address for the HTTP transport (default localhost:8000) |
 | `MCP_AUTH_TOKEN` | shared HTTP bearer token, with caller-supplied attribution |
-| `MCP_AUTH_CLIENTS_FILE` | path to a JSON file mapping client IDs to individual bearer tokens. Set exactly one HTTP credential option |
+| `MCP_AUTH_CLIENTS_FILE` | path to reloadable client token hashes and read/write scopes. Set exactly one HTTP credential option |
 | `MCP_ALLOWED_HOSTS` | comma-separated public hostnames (e.g. a Tailscale Funnel host) allowed past the SDK's DNS-rebinding `Host` check — see Phase 4C |
 | `MCP_ENABLE_DEMO_TOOLS` | `1` = add `lock_hold(seconds)` demo tool for contention demos |
-| `MCP_DEBUG_LOG` | path; server-side forensic record of every tool call |
+| `MCP_DEBUG_LOG` | path for JSON timing and outcome records with fact contents redacted |
 
 ## Audit verification and recovery
 
-Run these commands from the repository root with the project environment active.
-
 ```sh
-python tools/memory_admin.py verify memory.db
-python tools/memory_admin.py backup memory.db memory-backup.zip
-python tools/memory_admin.py restore memory-backup.zip recovered.db
-python tools/memory_admin.py verify recovered.db --expected-head <head-from-backup>
+python tools/memory_admin.py verify memory.db --replay
+python tools/memory_admin.py head memory.db
+python tools/memory_admin.py keygen /secure/checkpoint.key
+python tools/memory_admin.py checkpoint memory.db /secure/heads/snapshot.json --key-file /secure/checkpoint.key
+python tools/memory_admin.py backup memory.db full.zip --key-file /secure/checkpoint.key
+python tools/memory_admin.py incremental memory.db delta.zip --since full.zip --key-file /secure/checkpoint.key
+python tools/memory_admin.py restore full.zip recovered.db --incremental delta.zip --key-file /secure/checkpoint.key --expected-head <trusted-head>
 ```
 
-Each event's SHA-256 hash covers its fields, event ID, and predecessor
-hash. Fact mutations and their audit events commit together. The first
-database access after upgrading seals existing events in ID order, so
-stop older server processes and make a pre-upgrade backup before opening
-a legacy database with the new server. Historical attribution retains
-the trust level it had when the event was recorded.
+Versioned audit events commit with facts and vectors. Replay checks every fact's
+value, source, timestamp, and embedding against the baseline and subsequent
+events. HMAC authenticated checkpoints detect a rewritten or truncated snapshot
+when the key and latest checkpoint are protected independently from the database
+owner. The first access after upgrade seals the current legacy state as a
+baseline. Stop older servers and take a pre-upgrade backup before migrating.
 
-`verify` reports the event count and chain head. A trusted head saved
-outside SQLite for the same snapshot also detects a truncated tail or a
-rewritten chain. Keep that head in a separately controlled location.
-Someone with database write access can recompute hashes, and the event
-chain covers the event records only.
-
-`backup` uses SQLite's online backup API to capture a consistent snapshot,
-including committed writes in WAL, while the server is running. The ZIP
-contains the database and its SHA-256 checksum. `restore` checks the
-checksum, SQLite integrity, and the audit chain before publishing the
-database at a fresh path. Both commands refuse to overwrite existing
-files and require a destination filesystem that supports hard links.
-Restrict access to backup archives. To switch to a recovered database,
-stop the server and point its DB path at the recovered file.
-
-The server uses WAL with `synchronous=NORMAL`. SQLite preserves database
-consistency after a power loss, but recent acknowledged commits can be
-lost before a sync. Recovery from an archive returns the snapshot taken
-by that backup.
+Full backups use SQLite's online backup API. Incrementals contain subsequent
+events and changed vectors. Restore verifies checksums, hashes, replay, and
+authenticated heads before publishing to a new path. The retention command
+plans which complete generations to keep. Detailed upgrade steps, key custody,
+recovery commands, and durability limits are in [Recovery](docs/RECOVERY.md).
 
 ## Tests and benchmarks
 
-The integration suite speaks the real wire protocol over subprocess
-stdio and HTTP. The semantic lifecycle and latency tests load the
-embedding model. Lean server tests disable it.
+The suite includes 52 tests covering real subprocess and HTTP MCP
+traffic, legacy migration, replay tampering, signed checkpoints, incremental
+recovery, credential reload, scopes, and forced process termination. The
+hung-server regression test confirms that a silent server produces a bounded
+client timeout. The semantic lifecycle and latency tests load the real embedding
+model.
 
 ```sh
 python -m pytest tests/ -q
-python tools/bench_concurrency.py --clients 8 --writes 100
+python tools/crash_consistency.py --rounds 10
+python tools/bench_concurrency.py --clients 8 --writes 200 --synchronous FULL
+python tools/bench_mixed_http.py --clients 4 --operations 100
 ```
 
-The benchmark runs concurrent writes to one key in a fresh shared SQLite
-database with one stdio subprocess per client. It reports p50, p99,
-successful writes per second, and failures, excluding setup and warmup.
-See [Scaling the store](docs/SCALING.md) for design options and measurement
-limits.
+The concurrency benchmark reports throughput, p50, p99, and failures after
+warmup. The mixed HTTP benchmark measures embedded writes alongside unlogged
+reads in one process. Measurements and reproduction commands are published in
+[Scaling the store](docs/SCALING.md).
+
+## Operations
+
+HTTP serves authenticated `GET /healthz` and `GET /metrics`. Readiness checks
+database access. Metrics expose HTTP duration sums and counts, tool durations,
+server lock wait, authentication failures, chain length, and the active SQLite
+sync mode. Fact contents and credentials are omitted. Failed authentication
+attempts are logged to stderr. `MCP_DEBUG_LOG` records JSON timing and outcome
+metadata.
+
+The Docker image runs as UID/GID 10001. Make bind-mounted data directories
+writable by that identity, or mount a Docker-managed volume at `/data`.
+The server code is split into storage, audit, recovery, checkpoints, embeddings,
+HTTP transport, and telemetry modules.
 
 ## Design decisions
 
@@ -471,14 +489,14 @@ limits.
 - **What WAL does and does not buy here.** The concurrency that matters is
   *across* processes, and there WAL genuinely lets a reader proceed during
   another process's write transaction. Two honest caveats: (1) *within* one
-  process, `_SERVER_LOCK` serializes every tool call — WAL's reader/writer
-  parallelism never applies in-process; (2) by default `memory_get` logs an
+  process, `_SERVER_LOCK` serializes database access while write embeddings compute
+  under a separate model lock; (2) by default `memory_get` logs an
   event row, so **reads are writes** — they take the write lock and can
   queue behind another client. `MCP_LOG_READS=off` restores a genuinely
   read-only get at the cost of read attribution.
 - **Identity follows the transport.** Stdio and shared-token HTTP accept
   caller-supplied labels. Per-client HTTP assigns identity at authentication
-  and gives each authenticated client access to the same store.
+  with read or read/write access to the shared store.
 - **Input caps.** Keys and values are length-capped (defaults 256 / 16384)
   because a shared TEXT store with no limits is one `memory_set` away from
   a bloated database.
