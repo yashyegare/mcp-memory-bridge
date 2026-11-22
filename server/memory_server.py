@@ -72,6 +72,13 @@ EMBEDDINGS_ENABLED = os.environ.get("MCP_EMBEDDINGS", "1") != "off"
 # multi-MB value. Sized for facts, not documents (env-overridable).
 MAX_KEY_LEN = int(os.environ.get("MCP_MAX_KEY_LEN", "256"))
 MAX_VALUE_LEN = int(os.environ.get("MCP_MAX_VALUE_LEN", "16384"))
+# Search queries are embedded and copied into the audit log, so they get the
+# same kind of cap as keys and values.
+MAX_QUERY_LEN = int(os.environ.get("MCP_MAX_QUERY_LEN", "1024"))
+# memory_list / memory_history page size: default and hard ceiling. Without a
+# bound, one call on a large store serializes the whole table into a reply.
+DEFAULT_PAGE_SIZE = 100
+MAX_PAGE_SIZE = int(os.environ.get("MCP_MAX_PAGE_SIZE", "1000"))
 # Read logging: by default every memory_get appends an events row -- which
 # makes each read a WRITE (write lock + WAL frames). Set MCP_LOG_READS=off
 # for a truly read-only memory_get (it then completes even while another
@@ -119,6 +126,14 @@ def _validate(key: str, value: str | None = None) -> None:
             f"value exceeds {MAX_VALUE_LEN} characters (got {len(value)}); "
             "this store is for facts, not documents"
         )
+
+
+def _page_size(limit: int | None) -> int:
+    if limit is None:
+        return DEFAULT_PAGE_SIZE
+    if not 1 <= limit <= MAX_PAGE_SIZE:
+        raise ToolError(f"limit must be 1..{MAX_PAGE_SIZE} (got {limit})")
+    return limit
 
 
 def _db() -> sqlite3.Connection:
@@ -309,9 +324,13 @@ def memory_set(
 @mcp.tool()
 @_tool_guard
 @_db_guard
-def memory_get(key: str, ctx: Context, include_events: bool = False) -> str:
+def memory_get(
+    key: str, ctx: Context, include_events: bool = False, client_id: str | None = None
+) -> str:
     """Fetch a fact by exact key. With include_events=True, appends the
-    key's full write history from the events log."""
+    key's full write history from the events log. client_id attributes the
+    logged read (ignored when the HTTP server assigns identities)."""
+    cid = _client_id(ctx, client_id)
     _validate(key)
     row = _db().execute("SELECT value, source_client, updated_at FROM facts WHERE key = ?", (key,)).fetchone()
     if LOG_READS:
@@ -320,7 +339,7 @@ def memory_get(key: str, ctx: Context, include_events: bool = False) -> str:
         # at busy_timeout=0). MCP_LOG_READS=off gives a genuinely read-only
         # get, giving up read attribution. See README design notes.
         with _db():
-            _log(_client_id(ctx), "get", key, None)
+            _log(cid, "get", key, None)
     if row is None:
         # ToolError => isError=true with this message intact (mcp 2.x drops
         # the message of arbitrary exceptions; anticipated errors survive).
@@ -341,8 +360,11 @@ def memory_get(key: str, ctx: Context, include_events: bool = False) -> str:
 @mcp.tool()
 @_tool_guard
 @_db_guard
-def memory_list(ctx: Context, prefix: str = "") -> str:
-    """List facts whose key starts with `prefix` (all facts if empty)."""
+def memory_list(ctx: Context, prefix: str = "", limit: int | None = None, after: str = "") -> str:
+    """List facts whose key starts with `prefix` (all facts if empty), in key
+    order, at most `limit` per call (default 100). When more remain, the
+    reply ends with a line naming the `after` value for the next page."""
+    page = _page_size(limit)
     # Escape LIKE wildcards in the prefix, and tell SQLite which escape
     # character we used: without ESCAPE '\', "\%" is just backslash-percent
     # (a literal backslash followed by a wildcard), so a prefix containing
@@ -350,17 +372,21 @@ def memory_list(ctx: Context, prefix: str = "") -> str:
     escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     rows = _db().execute(
         "SELECT key, value, source_client, updated_at FROM facts "
-        "WHERE key LIKE ? ESCAPE '\\' ORDER BY key",
-        (escaped + "%",),
+        "WHERE key LIKE ? ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?",
+        (escaped + "%", after, page + 1),
     ).fetchall()
     if not rows:
         return f"(no facts matching prefix {prefix!r})"
-    return "\n".join(f"{r['key']} = {r['value']}  (source: {r['source_client']})" for r in rows)
+    more = len(rows) > page
+    rows = rows[:page]
+    out = "\n".join(f"{r['key']} = {r['value']}  (source: {r['source_client']})" for r in rows)
+    if more:
+        out += f"\n(more results: pass after={rows[-1]['key']!r})"
+    return out
 
 
 @mcp.tool()
 @_tool_guard
-@_db_guard
 def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
     """Find facts by MEANING, not key: embeds the query and returns the
     top_k most similar facts by cosine similarity. Works with different
@@ -371,13 +397,23 @@ def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
             "semantic search is disabled on this server (MCP_EMBEDDINGS=off); "
             "use memory_list with a key prefix instead"
         )
+    if not query or len(query) > MAX_QUERY_LEN:
+        raise ToolError(f"query must be 1..{MAX_QUERY_LEN} characters (got {len(query)})")
+    cid = _client_id(ctx)
+    # Embed before taking _SERVER_LOCK, as memory_set does: model work has
+    # its own lock, so other tools' database access isn't stuck behind it.
+    query_vec = embeddings._embed([query])[0]
+    return _guarded_search(query, query_vec, cid, top_k)
+
+
+@_db_guard
+def _guarded_search(query: str, query_vec, cid: str, top_k: int) -> str:
     rows = _db().execute(
         "SELECT f.key, f.value, f.source_client, f.updated_at, e.embedding "
         "FROM facts f JOIN fact_embeddings e ON e.key = f.key"
     ).fetchall()
     if not rows:
         return "(no searchable facts stored yet)"
-    query_vec = embeddings._embed([query])[0]
     scored = []
     for row in rows:
         vec = np.frombuffer(row["embedding"], dtype="float32")
@@ -387,7 +423,7 @@ def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
     top = scored[: max(1, top_k)]
     best_key, best_score = top[0][1]["key"], top[0][0]
     with _db():
-        _log(_client_id(ctx), "search", best_key, f"query={query!r} score={best_score:.3f}")
+        _log(cid, "search", best_key, f"query={query!r} score={best_score:.3f}")
     lines = [
         f"{row['key']} = {row['value']}  (cosine {score:.3f}, source: {row['source_client']})"
         for score, row in top
@@ -398,11 +434,16 @@ def memory_search(query: str, ctx: Context, top_k: int = 3) -> str:
 @mcp.tool()
 @_tool_guard
 @_db_guard
-def memory_history(key: str, ctx: Context, include_reads: bool = False) -> str:
+def memory_history(
+    key: str, ctx: Context, include_reads: bool = False, limit: int | None = None
+) -> str:
     """Full audit trail for one key: every set/delete/cas_fail event in
     order, with attribution -- who wrote what (and who tried and lost a
     CAS/create-only race), when. include_reads=True also shows every get
-    and every semantic-search hit on this key (verbose)."""
+    and every semantic-search hit on this key (verbose). Returns the most
+    recent `limit` events (default 100), oldest first."""
+    _validate(key)
+    page = _page_size(limit)
     actions = (
         "('set', 'get', 'delete', 'search', 'cas_fail')"
         if include_reads
@@ -410,12 +451,15 @@ def memory_history(key: str, ctx: Context, include_reads: bool = False) -> str:
     )
     rows = _db().execute(
         f"SELECT timestamp, client_id, action, value FROM events "
-        f"WHERE key = ? AND action IN {actions} ORDER BY id",
-        (key,),
+        f"WHERE key = ? AND action IN {actions} ORDER BY id DESC LIMIT ?",
+        (key, page + 1),
     ).fetchall()
     if not rows:
         return f"(no recorded history for key {key!r})"
-    return "\n".join(f"{r['timestamp']} {r['client_id']:>14} {r['action']:>6}: {r['value']}" for r in rows)
+    more = len(rows) > page
+    rows = rows[:page][::-1]
+    prefix = f"(showing the latest {page} events; raise limit for more)\n" if more else ""
+    return prefix + "\n".join(f"{r['timestamp']} {r['client_id']:>14} {r['action']:>6}: {r['value']}" for r in rows)
 
 
 @mcp.tool()

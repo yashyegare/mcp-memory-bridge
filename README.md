@@ -241,7 +241,9 @@ Implemented by hand against `test_server.py`:
 ### Phase 2 — shared memory server
 
 Tools: `memory_set` (with optional CAS) · `memory_get` · `memory_list` ·
-`memory_delete` · `memory_search` · `memory_history`. SQLite in WAL mode;
+`memory_delete` · `memory_search` · `memory_history`. `memory_list` pages in
+key order (`limit`, then `after=<last key>`); `memory_history` returns the
+latest `limit` events. SQLite in WAL mode;
 every mutation is attributed (`source_client`) and appended to an `events`
 audit table.
 
@@ -394,6 +396,8 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 | `MCP_PRELOAD_MODEL` | `1` = start loading the embedding model in a background thread |
 | `MCP_LOG_READS` | `off` = `memory_get` becomes truly read-only (see design notes) |
 | `MCP_MAX_KEY_LEN` / `MCP_MAX_VALUE_LEN` | input caps (defaults 256 / 16384 chars) |
+| `MCP_MAX_QUERY_LEN` | `memory_search` query cap (default 1024 chars) |
+| `MCP_MAX_PAGE_SIZE` | largest `limit` accepted by `memory_list` / `memory_history` (default 1000; default page 100) |
 | `MCP_TRANSPORT` | `stdio` (default, one subprocess per client) or `http` |
 | `MCP_HTTP_HOST` / `MCP_HTTP_PORT` | bind address for the HTTP transport (default localhost:8000) |
 | `MCP_AUTH_TOKEN` | shared HTTP bearer token, with caller-supplied attribution |
@@ -493,7 +497,8 @@ HTTP transport, and telemetry modules.
 - **Known trade-offs.** stdio keeps one server per client (the HTTP
   transport removes that limit when needed); values are plain TEXT;
   `memory_list` uses a prefix `LIKE` query, and write transactions serialize
-  across processes.
+  across processes. CAS compares values, not versions, so an A→B→A change
+  between a caller's read and its CAS write is not detected.
 
 ## Debugging
 

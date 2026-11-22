@@ -36,6 +36,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import urllib.error
 import urllib.request
 
@@ -170,9 +171,15 @@ class RawMCPClient:
         """
         request_id = self._next_id()
         self._send({"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}})
-        deadline_timeout = self.default_timeout if timeout is None else timeout
+        # One deadline for the whole request: interleaved notifications or
+        # server-initiated requests must not keep resetting the clock.
+        budget = self.default_timeout if timeout is None else timeout
+        deadline = time.monotonic() + budget
         while True:
-            msg = self._recv(deadline_timeout)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ConnectionError(f"No response to {method!r} within {budget}s")
+            msg = self._recv(remaining)
             if "id" not in msg:
                 # A notification (no id, no reply expected) -- e.g.
                 # notifications/tools/list_changed. Stash and keep waiting.
