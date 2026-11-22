@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-memory-bridge"
+version = "0.1.0"
+description = "Shared SQLite-backed memory for MCP clients, with an audit trail, recovery tools, and optional semantic search."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "yashyegare" }]
+requires-python = ">=3.11"
+keywords = ["mcp", "model-context-protocol", "memory", "sqlite", "claude"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+]
+# Lean runtime: the memory, recovery, and HTTP tools. uvicorn, starlette, and
+# anyio arrive with mcp. Exact versions CI tests against live in
+# requirements.txt, which doubles as a pip constraints file.
+dependencies = [
+    "mcp>=2.2,<3",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+# Semantic search pulls in torch (~2GB); install only when you want it.
+semantic = ["sentence-transformers>=3"]
+dev = ["pytest>=8", "ruff==0.16.8", "build>=1.2"]
+
+[project.scripts]
+mcp-memory-bridge = "mcp_memory_bridge.server:main"
+mcp-memory-admin = "mcp_memory_bridge.admin:main"
+
+[project.urls]
+Homepage = "https://github.com/yashyegare/mcp-memory-bridge"
+Issues = "https://github.com/yashyegare/mcp-memory-bridge/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

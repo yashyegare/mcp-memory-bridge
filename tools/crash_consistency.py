@@ -14,9 +14,10 @@ from tempfile import TemporaryDirectory
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "client"))
-sys.path.insert(0, str(ROOT / "server"))
-import recovery  # noqa: E402
+sys.path.insert(0, str(ROOT / "src"))  # works installed or from a checkout
 from raw_client import RawMCPClient  # noqa: E402
+
+from mcp_memory_bridge import recovery  # noqa: E402
 
 
 def run(rounds: int, mode: str, seed: int) -> None:
@@ -27,13 +28,13 @@ def run(rounds: int, mode: str, seed: int) -> None:
             # Capture the interpreter's PID because Windows venv launchers can
             # introduce an extra process between Popen and the actual server.
             program = (
-                "import os,sys,runpy; from pathlib import Path; "
+                "import os,sys; from pathlib import Path; "
                 "Path(sys.argv[1]).write_text(str(os.getpid())); "
-                "sys.argv=sys.argv[2:]; sys.path.insert(0, str(Path(sys.argv[0]).parent)); "
-                "runpy.run_path(sys.argv[0], run_name='__main__')"
+                "sys.path.insert(0, sys.argv[2]); "
+                "from mcp_memory_bridge.server import main; main(sys.argv[3:])"
             )
             client = RawMCPClient(
-                [sys.executable, "-c", program, str(pid_file), str(ROOT / "server" / "memory_server.py"), str(database)],
+                [sys.executable, "-c", program, str(pid_file), str(ROOT / "src"), str(database)],
                 env={"MCP_TRANSPORT": "stdio", "MCP_EMBEDDINGS": "off", "MCP_LOG_READS": "off",
                      "MCP_SQLITE_SYNCHRONOUS": mode},
                 default_timeout=10,

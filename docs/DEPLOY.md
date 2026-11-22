@@ -178,7 +178,7 @@ sudo systemctl status memory-server     # is the API up?
 sudo journalctl -u memory-server -n 50  # last 50 log lines
 sudo systemctl restart memory-server    # after code changes
 cd ~/mcp-memory-bridge && git pull && sudo bash deploy/setup.sh   # update
-venv alias not needed: /opt/mcp-memory/venv/bin/python server/memory_server.py --help
+venv alias not needed: /opt/mcp-memory/venv/bin/mcp-memory-bridge --help
 ```
 
 ## Teardown — the only 100% guarantee

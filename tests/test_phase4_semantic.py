@@ -5,13 +5,11 @@ test spawns a fresh server subprocess, so each would pay the embedding
 model's load cost separately. One test, one load."""
 
 import importlib.util
-import sys
 
 import pytest
-from conftest import ROOT
+from conftest import SERVER_CMD
 from test_memory_admin import _admin
 
-MEMORY_SERVER = str(ROOT / "server" / "memory_server.py")
 ST_AVAILABLE = importlib.util.find_spec("sentence_transformers") is not None
 
 
@@ -26,7 +24,7 @@ def _memory_client(make_client, tmp_path, extra_env=None):
     # pays the model load, which can stretch past a minute on a loaded
     # machine (measured 9s idle, >45s under parallel load).
     client = make_client(
-        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        [*SERVER_CMD, str(tmp_path / "memory.db")],
         env={"MCP_EMBEDDINGS": "off", **(extra_env or {})},
         default_timeout=120.0,
     )
@@ -107,7 +105,7 @@ def test_semantic_search_full_lifecycle(make_client, tmp_path):
     result = _admin("restore", full, restored, "--incremental", delta)
     assert result.returncode == 0, result.stderr
     assert _admin("verify", restored, "--replay").returncode == 0
-    recovered = make_client([sys.executable, MEMORY_SERVER, str(restored)],
+    recovered = make_client([*SERVER_CMD, str(restored)],
                             env={"MCP_EMBEDDINGS": "1"}, default_timeout=120)
     recovered.initialize()
     found = recovered.call_tool("memory_search", {"query": "bright screen preference"})

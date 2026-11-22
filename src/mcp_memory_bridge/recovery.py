@@ -10,9 +10,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from zipfile import ZipFile, is_zipfile
 
-import audit
-import checkpoints
-from local_files import publish
+from . import audit, checkpoints
+from .local_files import publish
 
 
 def read_only(path: Path) -> sqlite3.Connection:

@@ -4,14 +4,11 @@ import sys
 from contextlib import closing
 from zipfile import ZipFile
 
-from conftest import ROOT
-
-SERVER = ROOT / "server" / "memory_server.py"
-ADMIN = ROOT / "tools" / "memory_admin.py"
+from conftest import SERVER_CMD
 
 
 def _admin(*args):
-    return subprocess.run([sys.executable, str(ADMIN), *map(str, args)],
+    return subprocess.run([sys.executable, "-m", "mcp_memory_bridge.admin", *map(str, args)],
                           capture_output=True, text=True, timeout=15, check=False)
 
 
@@ -27,7 +24,7 @@ def test_legacy_migration_backup_restore_and_verification(make_client, tmp_path)
             );
             INSERT INTO events VALUES (7, 'legacy-time', 'legacy', 'set', 'old', 'original');
         """)
-    live = make_client([sys.executable, str(SERVER), str(db)], env={"MCP_EMBEDDINGS": "off"})
+    live = make_client([*SERVER_CMD, str(db)], env={"MCP_EMBEDDINGS": "off"})
     live.initialize()
     assert not live.call_tool("memory_set", {"key": "snapshot", "value": "before"}).get("isError")
     saved = _admin("backup", db, archive)
@@ -39,7 +36,7 @@ def test_legacy_migration_backup_restore_and_verification(make_client, tmp_path)
     assert recovered.returncode == 0, recovered.stderr
     assert _admin("restore", archive, restored).returncode == 1
     assert _admin("verify", restored, "--expected-head", head).returncode == 0
-    reader = make_client([sys.executable, str(SERVER), str(restored)],
+    reader = make_client([*SERVER_CMD, str(restored)],
                          env={"MCP_EMBEDDINGS": "off", "MCP_LOG_READS": "off"})
     reader.initialize()
     assert "snapshot = before" in reader.call_tool("memory_get", {"key": "snapshot"})["content"][0]["text"]

@@ -4,11 +4,8 @@ Each test gets a fresh temporary database, but the server under test is the
 real one -- real subprocess, real wire protocol, real SQLite file."""
 
 import sqlite3
-import sys
 
-from conftest import ROOT
-
-MEMORY_SERVER = str(ROOT / "server" / "memory_server.py")
+from conftest import SERVER_CMD
 
 
 def _text(result: dict) -> str:
@@ -19,7 +16,7 @@ def _memory_client(make_client, tmp_path):
     # MCP_EMBEDDINGS=off: these tests exercise storage/concurrency, not the
     # embedding model (loading it per test would add ~25s each).
     client = make_client(
-        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        [*SERVER_CMD, str(tmp_path / "memory.db")],
         env={"MCP_EMBEDDINGS": "off"},
     )
     client.initialize()
@@ -130,14 +127,14 @@ def test_log_reads_off_makes_get_truly_read_only(make_client, tmp_path):
     and (b) leave zero 'get' rows in the events table."""
     db_path = str(tmp_path / "memory.db")
     writer = make_client(
-        [sys.executable, MEMORY_SERVER, db_path],
+        [*SERVER_CMD, db_path],
         env={"MCP_EMBEDDINGS": "off", "MCP_ENABLE_DEMO_TOOLS": "1"},
     )
     writer.initialize()
     writer.call_tool("memory_set", {"key": "r", "value": "v"})
 
     reader = make_client(
-        [sys.executable, MEMORY_SERVER, db_path],
+        [*SERVER_CMD, db_path],
         env={"MCP_EMBEDDINGS": "off", "MCP_LOG_READS": "off", "MCP_SQLITE_BUSY_TIMEOUT": "0"},
     )
     reader.initialize()
@@ -276,11 +273,11 @@ def _contended_lock_scenario(make_client, tmp_path, extra_env):
 
     env = {"MCP_EMBEDDINGS": "off", **extra_env}
     a = make_client(
-        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        [*SERVER_CMD, str(tmp_path / "memory.db")],
         env={**env, "MCP_CLIENT_ID": "A"},
     )
     b = make_client(
-        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        [*SERVER_CMD, str(tmp_path / "memory.db")],
         env={**env, "MCP_CLIENT_ID": "B"},
     )
     a.initialize()

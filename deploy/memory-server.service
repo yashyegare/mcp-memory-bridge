@@ -14,8 +14,8 @@ User=memory
 Group=memory
 # Holds MCP_AUTH_TOKEN etc.; chmod 600, owned by 'memory' (setup.sh).
 EnvironmentFile=/opt/mcp-memory/env
-WorkingDirectory=/opt/mcp-memory/repo
-ExecStart=/opt/mcp-memory/venv/bin/python server/memory_server.py /opt/mcp-memory/data/memory.db
+WorkingDirectory=/opt/mcp-memory/data
+ExecStart=/opt/mcp-memory/venv/bin/mcp-memory-bridge /opt/mcp-memory/data/memory.db
 Restart=on-failure
 RestartSec=2
 

@@ -1,3 +1,6 @@
+# Exact versions CI tests against. The package's own dependency ranges live
+# in pyproject.toml; use this file as constraints when installing:
+#   pip install -c requirements.txt -e ".[semantic,dev]"
 mcp==2.2.0
 # 2.2.6, not 2.5.x: numpy >=2.5 requires Python >=3.12, and the CI matrix
 # runs 3.11-3.13. 2.2.6 officially supports 3.10-3.13 (ST needs >=1.24).
@@ -7,9 +10,9 @@ pytest==9.1.1
 
 # Notes:
 # - Tested on Python 3.11-3.13 (CI matrix); developed on 3.13 (Windows).
-# - CI also lint-checks (ruff, see ruff.toml) and builds the lean Docker
-#   image, which installs only mcp + numpy directly.
-# - sentence-transformers is optional at runtime (MCP_EMBEDDINGS=off runs
-#   the server without it) but required for the Phase 4 semantic tests.
+# - CI also lint-checks (ruff, see ruff.toml), builds and installs the
+#   wheel, and builds the lean Docker image (the package without extras).
+# - sentence-transformers is the [semantic] extra: optional at runtime (the
+#   server auto-detects it) but required for the Phase 4 semantic tests.
 # - The all-MiniLM-L6-v2 model (~80MB) downloads to the local HF cache on
 #   first use; after that the server forces offline mode automatically.

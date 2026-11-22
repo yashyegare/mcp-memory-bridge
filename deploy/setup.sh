@@ -25,18 +25,17 @@ if [ ! -x "$BASE/venv/bin/python" ]; then
   echo "== creating venv (first run only) =="
   python3 -m venv "$BASE/venv"
   "$BASE/venv/bin/pip" install --quiet --upgrade pip
-  # Lean mode, matching the Dockerfile: only the two runtime deps.
-  "$BASE/venv/bin/pip" install --quiet "mcp==2.2.0" "numpy==2.2.6"
 fi
 
-# --- deploy the code (ProtectHome=true hides /home from the service, so
-# the repo must live outside it -- $REPO_DIR is just the git checkout) ----
-echo "== syncing code into $BASE/repo =="
-rm -rf "$BASE/repo"
-mkdir -p "$BASE/repo"
-cp -a "$REPO_DIR"/. "$BASE/repo"/
-rm -rf "$BASE/repo/.git" "$BASE/repo/venv" "$BASE/repo/.github"
-chown -R memory:memory "$BASE/repo"
+# --- install the package (ProtectHome=true hides /home from the service,
+# so the code is installed into $BASE/venv rather than run from the
+# checkout). Lean mode, matching the Dockerfile: no [semantic] extra. The
+# second step reinstalls the code on every run, since a git pull usually
+# leaves the version number unchanged. -----------------------------------
+echo "== installing mcp-memory-bridge into $BASE/venv =="
+"$BASE/venv/bin/pip" install --quiet -c "$REPO_DIR/requirements.txt" "$REPO_DIR"
+"$BASE/venv/bin/pip" install --quiet --no-deps --force-reinstall "$REPO_DIR"
+rm -rf "$BASE/repo"  # code synced by older versions of this script
 
 # --- systemd service ----------------------------------------------------
 cp "$REPO_DIR/deploy/memory-server.service" /etc/systemd/system/memory-server.service

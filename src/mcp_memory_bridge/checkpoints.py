@@ -7,8 +7,8 @@ import secrets
 import sqlite3
 from pathlib import Path
 
-import audit
-from local_files import write_new
+from . import audit
+from .local_files import write_new
 
 
 def key_bytes(path: Path) -> bytes:
