@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -31,9 +32,16 @@ def _unique_object(pairs):
 
 
 class Credentials:
-    """Read a complete configuration on every request so revocations apply immediately."""
+    """Check the configuration on every request so revocations apply immediately.
+
+    The file is re-parsed only when its (mtime_ns, size, inode) changes; an
+    unchanged file reuses the last validated result. A stat failure still
+    fails closed, exactly like a read failure did before."""
     def __init__(self, path: str, shared_token: str):
         self.path = path
+        self._cache_lock = threading.Lock()
+        self._cache_stamp: tuple | None = None
+        self._cache: list[tuple[str, str | None, list[str]]] = []
         self.shared_digest = hashlib.sha256(shared_token.encode("utf-8")).hexdigest()
         if bool(path) == bool(shared_token):
             raise ValueError("HTTP requires exactly one of MCP_AUTH_TOKEN or MCP_AUTH_CLIENTS_FILE")
@@ -44,6 +52,21 @@ class Credentials:
     def load(self) -> list[tuple[str, str | None, list[str]]]:
         if not self.path:
             return [(self.shared_digest, None, ["read", "write"])]
+        info = os.stat(self.path)
+        stamp = (info.st_mtime_ns, info.st_size, info.st_ino)
+        # A file edited within the last couple of seconds may share an mtime
+        # with its previous contents on filesystems with coarse timestamps,
+        # so recent edits are always re-parsed ("racy git" rule).
+        settled = time.time_ns() - info.st_mtime_ns > 2_000_000_000
+        with self._cache_lock:
+            if settled and stamp == self._cache_stamp:
+                return self._cache
+        credentials = self._parse()
+        with self._cache_lock:
+            self._cache_stamp, self._cache = stamp, credentials
+        return credentials
+
+    def _parse(self) -> list[tuple[str, str | None, list[str]]]:
         clients = json.loads(Path(self.path).read_text(encoding="utf-8"), object_pairs_hook=_unique_object)
         if not isinstance(clients, dict):
             raise ValueError("expected an object mapping client IDs to credentials")
