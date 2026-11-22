@@ -56,7 +56,7 @@ transport for remote use.
 
 ## Verification and recorded experiments
 
-The current version passed 52 tests locally and in the Python 3.11–3.13 CI
+The current version passed 59 tests locally and in the Python 3.11–3.13 CI
 matrix. A local recovery drill on November 10, 2026 exercised two clients,
 a rejected CAS, signed full and incremental backups, restore, replay, and
 rejection of tampered data, corrupt archives, and an incorrect checkpoint key.
@@ -433,7 +433,7 @@ recovery commands, and durability limits are in [Recovery](docs/RECOVERY.md).
 
 ## Tests and benchmarks
 
-The suite includes 52 tests covering real subprocess and HTTP MCP
+The suite includes 59 tests covering real subprocess and HTTP MCP
 traffic, legacy migration, replay tampering, signed checkpoints, incremental
 recovery, credential reload, scopes, and forced process termination. The
 hung-server regression test confirms that a silent server produces a bounded
