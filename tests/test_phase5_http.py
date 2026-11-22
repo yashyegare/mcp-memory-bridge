@@ -20,10 +20,9 @@ import urllib.request
 from contextlib import contextmanager
 
 import pytest
-from conftest import ROOT
+from conftest import SERVER_CMD
 from raw_client import MCPError, RawHTTPMCPClient
 
-MEMORY_SERVER = str(ROOT / "server" / "memory_server.py")
 TOKEN = "test-token-0123456789"
 
 
@@ -47,11 +46,13 @@ def _serve_http(db, **auth_env):
         **auth_env,
     }
     pid_file = db.with_suffix(".pid")
-    program = ("import os,sys,runpy; from pathlib import Path; "
-               "Path(sys.argv[1]).write_text(str(os.getpid())); sys.argv=sys.argv[2:]; "
-               "sys.path.insert(0, str(Path(sys.argv[0]).parent)); runpy.run_path(sys.argv[0], run_name='__main__')")
+    # Record the interpreter's own PID (a venv launcher can sit in between),
+    # then run the package entry point in-process.
+    program = ("import os,sys; from pathlib import Path; "
+               "Path(sys.argv[1]).write_text(str(os.getpid())); "
+               "from mcp_memory_bridge.server import main; main(sys.argv[2:])")
     proc = subprocess.Popen(
-        [sys.executable, "-c", program, str(pid_file), MEMORY_SERVER, str(db)],
+        [sys.executable, "-c", program, str(pid_file), str(db)],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env,
     )
     url = f"http://127.0.0.1:{port}/mcp"
@@ -163,7 +164,7 @@ def test_http_server_refuses_to_start_without_token(tmp_path):
     env = {**os.environ, "MCP_TRANSPORT": "http", "MCP_AUTH_TOKEN": "", "MCP_AUTH_CLIENTS_FILE": "",
            "MCP_EMBEDDINGS": "off"}
     proc = subprocess.Popen(
-        [sys.executable, MEMORY_SERVER, str(tmp_path / "m.db")],
+        [*SERVER_CMD, str(tmp_path / "m.db")],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, env=env,
     )
     try:

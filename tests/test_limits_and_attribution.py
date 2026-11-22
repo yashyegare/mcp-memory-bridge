@@ -8,10 +8,8 @@ import sys
 import time
 
 import pytest
-from conftest import ROOT
+from conftest import SERVER_CMD
 from raw_client import RawMCPClient
-
-MEMORY_SERVER = str(ROOT / "server" / "memory_server.py")
 
 
 def _text(result: dict) -> str:
@@ -20,7 +18,7 @@ def _text(result: dict) -> str:
 
 def _memory_client(make_client, tmp_path, **env):
     client = make_client(
-        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        [*SERVER_CMD, str(tmp_path / "memory.db")],
         env={"MCP_EMBEDDINGS": "off", **env},
     )
     client.initialize()
@@ -82,8 +80,7 @@ def test_search_query_length_is_capped_before_the_model_loads(make_client, tmp_p
 
 
 def test_credentials_reparse_only_when_file_changes(tmp_path, monkeypatch):
-    sys.path.insert(0, str(ROOT / "server"))
-    import http_transport
+    from mcp_memory_bridge import http_transport
 
     token = "a" * 40
     path = tmp_path / "clients.json"

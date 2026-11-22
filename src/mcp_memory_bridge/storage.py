@@ -2,7 +2,7 @@
 
 import sqlite3
 
-import audit
+from . import audit
 
 
 def initialize(conn: sqlite3.Connection, synchronous: str = "NORMAL") -> None:

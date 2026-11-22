@@ -10,13 +10,11 @@ not millisecond precision."""
 import importlib.util
 import os
 import statistics
-import sys
 import time
 
 import pytest
-from conftest import ROOT
+from conftest import SERVER_CMD
 
-MEMORY_SERVER = str(ROOT / "server" / "memory_server.py")
 ST_AVAILABLE = importlib.util.find_spec("sentence_transformers") is not None
 ON_CI = os.environ.get("CI") == "true"
 
@@ -47,7 +45,7 @@ def test_warm_write_and_search_latency(make_client, tmp_path):
     """Warm memory_set < 100ms and memory_search < 50ms (median), including
     the embedding write, across a realistically-sized store."""
     client = make_client(
-        [sys.executable, MEMORY_SERVER, str(tmp_path / "memory.db")],
+        [*SERVER_CMD, str(tmp_path / "memory.db")],
         env={"MCP_CLIENT_ID": "bench"},
         default_timeout=180.0,  # first embedded write may pay the model load
     )

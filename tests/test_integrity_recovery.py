@@ -1,25 +1,21 @@
 import json
 import sqlite3
-import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from threading import Barrier
 from zipfile import ZipFile
 
 import pytest
-from conftest import ROOT
+from conftest import SERVER_CMD
 from test_memory_admin import _admin
 
-sys.path.insert(0, str(ROOT / "server"))
-import audit
-
-SERVER = ROOT / "server" / "memory_server.py"
+from mcp_memory_bridge import audit
 
 
 @pytest.fixture
 def store(make_client, tmp_path):
     path = tmp_path / "memory.db"
-    client = make_client([sys.executable, str(SERVER), str(path)], env={"MCP_EMBEDDINGS": "off"})
+    client = make_client([*SERVER_CMD, str(path)], env={"MCP_EMBEDDINGS": "off"})
     client.initialize()
     assert not client.call_tool("memory_set", {"key": "k", "value": "one"}).get("isError")
     return path, client
@@ -147,7 +143,7 @@ def test_legacy_baseline_preserves_state_and_blocks_older_writers(make_client, t
             db.execute("ALTER TABLE events ADD COLUMN event_hash TEXT")
             row = db.execute(f"SELECT {audit.EVENT_FIELDS} FROM events").fetchone()
             db.execute("UPDATE events SET prev_hash=?, event_hash=?", (audit.GENESIS, audit._digest(audit.GENESIS, row)))
-    client = make_client([sys.executable, str(SERVER), str(path)], env={"MCP_EMBEDDINGS": "off"})
+    client = make_client([*SERVER_CMD, str(path)], env={"MCP_EMBEDDINGS": "off"})
     client.initialize()
     client.call_tool("memory_list", {})
     _ok("verify", path, "--replay")
@@ -165,7 +161,7 @@ def test_concurrent_initialization_and_writes_preserve_one_chain(make_client, tm
     path = tmp_path / "shared.db"
     clients = []
     for _ in range(4):
-        client = make_client([sys.executable, str(SERVER), str(path)], env={"MCP_EMBEDDINGS": "off"})
+        client = make_client([*SERVER_CMD, str(path)], env={"MCP_EMBEDDINGS": "off"})
         client.initialize()
         clients.append(client)
     barrier = Barrier(len(clients))
@@ -192,7 +188,7 @@ def test_upgrade_rejects_damaged_version_one_chain(make_client, tmp_path):
                 client_id TEXT NOT NULL, action TEXT NOT NULL, key TEXT, value TEXT, prev_hash TEXT, event_hash TEXT);
             INSERT INTO events VALUES(1,'t','old','set','key','value','wrong','wrong');
         """)
-    client = make_client([sys.executable, str(SERVER), str(path)], env={"MCP_EMBEDDINGS": "off"})
+    client = make_client([*SERVER_CMD, str(path)], env={"MCP_EMBEDDINGS": "off"})
     client.initialize()
     assert client.call_tool("memory_set", {"key": "new", "value": "value"})["isError"]
     with closing(sqlite3.connect(path)) as db:

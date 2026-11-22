@@ -36,10 +36,11 @@ jobs:
       - name: Install system deps
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tzdata
 
-      - name: Install dependencies
+      # The package plus extras, pinned to the tested versions.
+      - name: Install package
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -c requirements.txt -e ".[semantic,dev]"
 
       # Warm the HF cache so the server's cache-detection logic flips into
       # offline mode exactly like on a developer machine after first use.
@@ -54,6 +55,36 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -v
+
+  package:
+    # Build the sdist and wheel, install the wheel alone into a fresh venv
+    # (no checkout on the path), and check that both commands work and the
+    # installed server speaks MCP.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: pip install "build>=1.2"
+      - run: python -m build
+      - name: Install wheel in a clean venv
+        run: |
+          python -m venv /tmp/venv
+          /tmp/venv/bin/pip install -c requirements.txt dist/*.whl
+      - name: Smoke test installed commands
+        working-directory: /tmp
+        run: |
+          /tmp/venv/bin/mcp-memory-bridge --version
+          /tmp/venv/bin/mcp-memory-admin --help > /dev/null
+          printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci","version":"0.0.0"}}}' \
+            | /tmp/venv/bin/mcp-memory-bridge /tmp/ci.db \
+            | grep -q '"serverInfo"'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
 
   docker:
     runs-on: ubuntu-latest
@@ -79,4 +110,4 @@ jobs:
       - name: Smoke test storage as non-root
         run: |
           docker run --rm --entrypoint python mcp-memory-bridge:ci -c \
-            'import os, sqlite3, sys; sys.path.insert(0, "/app/server"); import storage, audit; assert os.geteuid() != 0; db = sqlite3.connect("/data/smoke.db"); storage.initialize(db, "FULL"); assert audit.verify(db, replay=True)[0] == 1'
+            'import os, sqlite3; from mcp_memory_bridge import audit, storage; assert os.geteuid() != 0; db = sqlite3.connect("/data/smoke.db"); storage.initialize(db, "FULL"); assert audit.verify(db, replay=True)[0] == 1'

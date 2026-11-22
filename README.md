@@ -30,7 +30,7 @@ stdio mode — each client spawns its own server subprocess:
         │  stdio           │  stdio           │  stdio
         ▼                  ▼                  ▼
  ┌─────────────────────────────────────────────────────┐
- │ memory_server.py — one subprocess per client,       │
+ │ mcp-memory-bridge — one subprocess per client,      │
  │ all pointing at the same store                      │
  └──────────────────────────┬──────────────────────────┘
                             ▼
@@ -45,7 +45,7 @@ stdio mode — each client spawns its own server subprocess:
 HTTP mode serves multiple client sessions from one running server.
 
 ```text
- MCP clients ──HTTP──► memory_server.py ──► shared SQLite database
+ MCP clients ──HTTP──► mcp-memory-bridge ──► shared SQLite database
                         bearer authentication
                         localhost by default
 ```
@@ -56,7 +56,7 @@ transport for remote use.
 
 ## Verification and recorded experiments
 
-The current version passed 59 tests locally and in the Python 3.11–3.13 CI
+The current version passed 63 tests locally and in the Python 3.11–3.13 CI
 matrix. A local recovery drill on November 10, 2026 exercised two clients,
 a rejected CAS, signed full and incremental backups, restore, replay, and
 rejection of tampered data, corrupt archives, and an incorrect checkpoint key.
@@ -77,93 +77,94 @@ The development experiments below record earlier runs
 - A previous deployment demonstrated authenticated HTTP access from a laptop
   through a tunnel to a GCP VM.
 
-## Quickstart
+## Install
 
-Use Python 3.11, 3.12, or 3.13. Run the examples from the repository root.
-
-```sh
-git clone https://github.com/yashyegare/mcp-memory-bridge.git
-cd mcp-memory-bridge
-python -m venv venv
-```
-
-For an existing checkout, open its directory and use its existing `venv`.
-
-### Windows PowerShell
-
-Install the lean runtime and open Python
-
-```powershell
-.\venv\Scripts\python.exe -m pip install mcp==2.2.0 numpy==2.2.6
-$env:MCP_TRANSPORT = "stdio"
-$env:MCP_EMBEDDINGS = "off"
-.\venv\Scripts\python.exe
-```
-
-### Linux and macOS
+Requires Python 3.11–3.13. The package is not on PyPI yet, so install it
+from GitHub.
 
 ```sh
-venv/bin/python -m pip install mcp==2.2.0 numpy==2.2.6
-export MCP_TRANSPORT=stdio
-export MCP_EMBEDDINGS=off
-venv/bin/python
+# Run without installing anything permanently (uv):
+uvx --from git+https://github.com/yashyegare/mcp-memory-bridge mcp-memory-bridge ~/mcp-memory.db
+
+# Or install the commands with pip or pipx:
+pipx install git+https://github.com/yashyegare/mcp-memory-bridge
 ```
 
-### Launch the memory server through the raw client
+That gives you two commands: `mcp-memory-bridge` (the server) and
+`mcp-memory-admin` (verify, back up, restore). This is the lean install:
+memory, recovery, and HTTP tools, with no ML stack. For semantic search, add
+the `semantic` extra (it pulls in PyTorch, roughly 2 GB):
 
-At the Python prompt, run
+```sh
+pipx install "mcp-memory-bridge[semantic] @ git+https://github.com/yashyegare/mcp-memory-bridge"
+```
+
+Semantic search switches on automatically when the extra is installed. Set
+`MCP_EMBEDDINGS=off` to force lean mode, or `MCP_EMBEDDINGS=1` to require it.
+
+### Use it from Claude Desktop or another MCP host
+
+Add a server entry to `claude_desktop_config.json` (or your host's
+equivalent). Every client that points at the same database file shares the
+same memory.
+
+```json
+{
+  "mcpServers": {
+    "memory": {
+      "command": "uvx",
+      "args": [
+        "--from", "git+https://github.com/yashyegare/mcp-memory-bridge",
+        "mcp-memory-bridge", "/absolute/path/to/memory.db"
+      ],
+      "env": { "MCP_CLIENT_ID": "claude-desktop" }
+    }
+  }
+}
+```
+
+With `pipx install`, use `"command": "mcp-memory-bridge"` and pass just the
+database path in `args`. `python -m mcp_memory_bridge <db>` also works.
+Configs that still run `server/memory_server.py` from a checkout keep
+working through a compatibility launcher.
+
+### Try it from Python
+
+The hand-written client in `client/raw_client.py` drives the server directly.
+From a checkout, with the package installed:
 
 ```python
 import sys
 sys.path.insert(0, "client")
 from raw_client import RawMCPClient
 
-client = RawMCPClient([
-    sys.executable,
-    "server/memory_server.py",
-    "local-demo.db"
-])
+client = RawMCPClient([sys.executable, "-m", "mcp_memory_bridge", "local-demo.db"])
 client.initialize()
-
 print([tool["name"] for tool in client.list_tools()])
-print(client.call_tool("memory_set", {
-    "key": "demo/theme",
-    "value": "dark"
-})["content"][0]["text"])
-print(client.call_tool("memory_get", {
-    "key": "demo/theme"
-})["content"][0]["text"])
-
+print(client.call_tool("memory_set", {"key": "demo/theme", "value": "dark"})["content"][0]["text"])
+print(client.call_tool("memory_get", {"key": "demo/theme"})["content"][0]["text"])
 client.close()
 ```
 
-The client starts the server, initializes MCP, and stores a fact in
-`local-demo.db`. The get response should contain `demo/theme = dark`.
-Call `exit()` to leave Python. To keep experimenting, leave `client.close()`
-until the end of your session. Lean mode supports the memory and recovery
-tools. Semantic search requires the optional embedding dependencies.
+The get response should contain `demo/theme = dark`. To see two clients
+share memory, create a second `RawMCPClient` with the same database path and
+call `memory_get` from it.
 
-To demonstrate two clients in the same Python session, create a second
-`RawMCPClient` with the same database path, initialize it, and call
-`memory_get`. Close both clients when finished.
+### Develop and run the tests
 
-### Semantic search and the test suite
-
-Install the full requirements using the project environment
-
-```powershell
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-.\venv\Scripts\python.exe -m pytest tests/ -q
+```sh
+git clone https://github.com/yashyegare/mcp-memory-bridge.git
+cd mcp-memory-bridge
+python -m venv venv
+venv/bin/pip install -c requirements.txt -e ".[semantic,dev]"   # Windows: venv\Scripts\pip
+venv/bin/python -m pytest
 ```
 
-On Linux/macOS, use `venv/bin/python` in place of the Windows interpreter path.
-Set `MCP_EMBEDDINGS=1` before launching the server to enable semantic search.
-The first embedding operation downloads the model if it is missing from the
-local cache.
-
-For the separate protocol-only echo/add smoke test, run
-`venv\Scripts\python.exe client/raw_client.py` on Windows or
-`venv/bin/python client/raw_client.py` on Linux/macOS.
+`requirements.txt` pins the exact versions CI tests against and is used as a
+constraints file. The test suite also runs from a plain checkout without the
+editable install. The first embedding operation downloads the model if it is
+not already in the local cache. For the protocol-only echo/add smoke test, run
+`python client/raw_client.py`.
 
 ### Docker
 
@@ -190,18 +191,15 @@ The named volume persists the database and WAL files. The image runs as UID/GID
 10001. Bind-mounted directories need write access for that identity. CI tests
 both the MCP handshake and storage under the non-root user.
 
-In the remaining examples, `python` refers to the project environment.
-Use `venv\Scripts\python.exe` on Windows or `venv/bin/python` on Linux/macOS
-when invoking commands without activating that environment.
+In the remaining examples, `python` refers to an environment with the package
+installed, and the tool scripts run from the repository root.
 
 ## Project layout
 
 ```
-client/
-  raw_client.py        # hand-rolled MCP clients: stdio + HTTP, handshake, tools/*
-server/
-  test_server.py       # trivial SDK server (echo, add) — Phase 1 target
-  memory_server.py     # SQLite-backed shared memory server — Phases 2/3/4
+src/mcp_memory_bridge/
+  server.py            # SQLite-backed shared memory server (mcp-memory-bridge)
+  admin.py             # verify, checkpoint, back up, restore (mcp-memory-admin)
   audit.py             # versioned hash chain and replay
   checkpoints.py       # authenticated external checkpoints
   recovery.py          # online full backups and event incrementals
@@ -209,8 +207,13 @@ server/
   embeddings.py        # lazy embedding model and its lock
   http_transport.py    # authentication, reload, operational endpoints
   telemetry.py         # process counters and redacted debug records
+client/
+  raw_client.py        # hand-rolled MCP clients: stdio + HTTP, handshake, tools/*
+server/
+  test_server.py       # trivial SDK server (echo, add) — Phase 1 target
+  memory_server.py     # compatibility launcher for older configs
 tools/
-  memory_admin.py      # verify, checkpoint, back up, restore, plan retention
+  memory_admin.py      # compatibility launcher for mcp-memory-admin
   crash_consistency.py # repeated forced termination and recovery checks
   bench_concurrency.py # stdio write throughput and latency
   bench_mixed_http.py  # embedded writes and unlogged HTTP reads
@@ -276,8 +279,8 @@ engineering lesson; the full stories are in [docs/NOTES.md](docs/NOTES.md).
 lock in client A while client B writes:
 
 ```bash
-venv\Scripts\python.exe tools\lock_demo.py          # busy_timeout=0: break
-venv\Scripts\python.exe tools\lock_demo.py --queue  # busy_timeout=5000: heal
+python tools\lock_demo.py          # busy_timeout=0: break
+python tools\lock_demo.py --queue  # busy_timeout=5000: heal
 ```
 
 - `busy_timeout=0` — B's write rejected in 0.02 s with a legible tool-level
@@ -309,9 +312,9 @@ per-key attribution history (writes, failed CAS attempts, optionally reads
 and search hits), and `tools/inspect_memory.py` pretty-prints the store:
 
 ```bash
-venv\Scripts\python.exe tools\inspect_memory.py --db memory.db    # overview
-venv\Scripts\python.exe tools\inspect_memory.py --key live/color  # one key's history
-venv\Scripts\python.exe tools\inspect_memory.py --searches        # search log
+python tools\inspect_memory.py --db memory.db    # overview
+python tools\inspect_memory.py --key live/color  # one key's history
+python tools\inspect_memory.py --searches        # search log
 ```
 
 ### HTTP transport and authentication
@@ -326,13 +329,13 @@ $env:MCP_EMBEDDINGS = "off"
 $env:MCP_HTTP_HOST = "127.0.0.1"
 $env:MCP_HTTP_PORT = "8000"
 $env:MCP_AUTH_CLIENTS_FILE = ""
-$env:MCP_AUTH_TOKEN = .\venv\Scripts\python.exe -c "import secrets; print(secrets.token_urlsafe(32))"
+$env:MCP_AUTH_TOKEN = python -c "import secrets; print(secrets.token_urlsafe(32))"
 $env:MCP_AUTH_TOKEN
-.\venv\Scripts\python.exe server/memory_server.py local-http.db
+mcp-memory-bridge local-http.db
 ```
 
 Keep that terminal running. In a second terminal at the repository root, open
-`.\venv\Scripts\python.exe` and run
+`python` and run
 
 ```python
 import getpass
@@ -388,11 +391,11 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 
 | Variable | Meaning |
 |---|---|
-| db argv / `MCP_MEMORY_DB` | which SQLite file to share |
+| db argument / `MCP_MEMORY_DB` | which SQLite file to share (default `memory.db`) |
 | `MCP_CLIENT_ID` | attribution for this client's writes and log entries |
 | `MCP_SQLITE_BUSY_TIMEOUT` | ms a write waits for the lock (default 5000; `0` = fail fast) |
 | `MCP_SQLITE_SYNCHRONOUS` | `NORMAL` (default) or `FULL`, applied to every server connection |
-| `MCP_EMBEDDINGS` | `off` = lean server, no ML stack |
+| `MCP_EMBEDDINGS` | unset = semantic search if the `[semantic]` extra is installed; `off` = lean server; `1` = require it |
 | `MCP_PRELOAD_MODEL` | `1` = start loading the embedding model in a background thread |
 | `MCP_LOG_READS` | `off` = `memory_get` becomes truly read-only (see design notes) |
 | `MCP_MAX_KEY_LEN` / `MCP_MAX_VALUE_LEN` | input caps (defaults 256 / 16384 chars) |
@@ -409,13 +412,13 @@ Per client, via env — Claude Desktop's `mcpServers.env` works the same way.
 ## Audit verification and recovery
 
 ```sh
-python tools/memory_admin.py verify memory.db --replay
-python tools/memory_admin.py head memory.db
-python tools/memory_admin.py keygen /secure/checkpoint.key
-python tools/memory_admin.py checkpoint memory.db /secure/heads/snapshot.json --key-file /secure/checkpoint.key
-python tools/memory_admin.py backup memory.db full.zip --key-file /secure/checkpoint.key
-python tools/memory_admin.py incremental memory.db delta.zip --since full.zip --key-file /secure/checkpoint.key
-python tools/memory_admin.py restore full.zip recovered.db --incremental delta.zip --key-file /secure/checkpoint.key --expected-head <trusted-head>
+mcp-memory-admin verify memory.db --replay
+mcp-memory-admin head memory.db
+mcp-memory-admin keygen /secure/checkpoint.key
+mcp-memory-admin checkpoint memory.db /secure/heads/snapshot.json --key-file /secure/checkpoint.key
+mcp-memory-admin backup memory.db full.zip --key-file /secure/checkpoint.key
+mcp-memory-admin incremental memory.db delta.zip --since full.zip --key-file /secure/checkpoint.key
+mcp-memory-admin restore full.zip recovered.db --incremental delta.zip --key-file /secure/checkpoint.key --expected-head <trusted-head>
 ```
 
 Versioned audit events commit with facts and vectors. Replay checks every fact's
@@ -433,7 +436,7 @@ recovery commands, and durability limits are in [Recovery](docs/RECOVERY.md).
 
 ## Tests and benchmarks
 
-The suite includes 59 tests covering real subprocess and HTTP MCP
+The suite includes 63 tests covering real subprocess and HTTP MCP
 traffic, legacy migration, replay tampering, signed checkpoints, incremental
 recovery, credential reload, scopes, and forced process termination. The
 hung-server regression test confirms that a silent server produces a bounded

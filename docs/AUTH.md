@@ -12,8 +12,8 @@ Set `MCP_TRANSPORT=http` and `MCP_AUTH_CLIENTS_FILE` to a private JSON file.
 Select exactly one credential source at startup.
 
 ```sh
-python tools/memory_admin.py token --scope read-write
-python tools/memory_admin.py token --scope read
+mcp-memory-admin token --scope read-write
+mcp-memory-admin token --scope read
 ```
 
 Each invocation prints a random bearer token and its credential object. Give the

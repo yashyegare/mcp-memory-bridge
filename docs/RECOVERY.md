@@ -21,11 +21,11 @@ trusted older backup or checkpoint for comparison.
 ## Replay and authenticated checkpoints
 
 ```sh
-python tools/memory_admin.py verify memory.db --replay
-python tools/memory_admin.py head memory.db
-python tools/memory_admin.py keygen /secure/checkpoint.key
-python tools/memory_admin.py checkpoint memory.db /secure/heads/snapshot-001.json --key-file /secure/checkpoint.key
-python tools/memory_admin.py verify memory.db --checkpoint /secure/heads/snapshot-001.json --key-file /secure/checkpoint.key
+mcp-memory-admin verify memory.db --replay
+mcp-memory-admin head memory.db
+mcp-memory-admin keygen /secure/checkpoint.key
+mcp-memory-admin checkpoint memory.db /secure/heads/snapshot-001.json --key-file /secure/checkpoint.key
+mcp-memory-admin verify memory.db --checkpoint /secure/heads/snapshot-001.json --key-file /secure/checkpoint.key
 ```
 
 Replay compares every fact's value, source, and timestamp with the state
@@ -62,11 +62,11 @@ to an older signed checkpoint. The server does not need the checkpoint key.
 ## Full and incremental backups
 
 ```sh
-python tools/memory_admin.py backup memory.db full-001.zip --key-file /secure/checkpoint.key
-python tools/memory_admin.py incremental memory.db delta-001.zip --since full-001.zip --key-file /secure/checkpoint.key
-python tools/memory_admin.py incremental memory.db delta-002.zip --since delta-001.zip --key-file /secure/checkpoint.key
-python tools/memory_admin.py restore full-001.zip recovered.db --incremental delta-001.zip --incremental delta-002.zip --key-file /secure/checkpoint.key --expected-head <trusted-final-head>
-python tools/memory_admin.py verify recovered.db --replay --expected-head <trusted-final-head>
+mcp-memory-admin backup memory.db full-001.zip --key-file /secure/checkpoint.key
+mcp-memory-admin incremental memory.db delta-001.zip --since full-001.zip --key-file /secure/checkpoint.key
+mcp-memory-admin incremental memory.db delta-002.zip --since delta-001.zip --key-file /secure/checkpoint.key
+mcp-memory-admin restore full-001.zip recovered.db --incremental delta-001.zip --incremental delta-002.zip --key-file /secure/checkpoint.key --expected-head <trusted-final-head>
+mcp-memory-admin verify recovered.db --replay --expected-head <trusted-final-head>
 ```
 
 A full backup captures a consistent SQLite online snapshot, including committed
@@ -96,7 +96,7 @@ needed to reach a recovery point.
 ## Retention policy
 
 ```sh
-python tools/memory_admin.py retention /backups --keep-full 3 --key-file /secure/checkpoint.key
+mcp-memory-admin retention /backups --keep-full 3 --key-file /secure/checkpoint.key
 ```
 
 Keep the newest three full snapshots per store, ordered by audit position, and

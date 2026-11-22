@@ -1,5 +1,6 @@
 """Lazy, serialized local embedding model access."""
 
+import importlib.util
 import os
 import sys
 import threading
@@ -7,7 +8,21 @@ from pathlib import Path
 
 from mcp.server.mcpserver.exceptions import ToolError
 
-EMBEDDINGS_ENABLED = os.environ.get("MCP_EMBEDDINGS", "1") != "off"
+
+def _enabled_from_env() -> bool:
+    """MCP_EMBEDDINGS: 'off' disables, any other set value enables. Unset (or
+    'auto') enables only when the [semantic] extra is installed, so a plain
+    `pip install mcp-memory-bridge` runs lean without extra configuration.
+    find_spec only locates the package; nothing heavy is imported here."""
+    setting = os.environ.get("MCP_EMBEDDINGS", "auto")
+    if setting == "off":
+        return False
+    if setting == "auto":
+        return importlib.util.find_spec("sentence_transformers") is not None
+    return True
+
+
+EMBEDDINGS_ENABLED = _enabled_from_env()
 
 _model = None
 _model_lock = threading.Lock()  # lazy load must be single-flight (preload thread vs first call)
@@ -53,7 +68,13 @@ def _embed(texts: list[str]):
                 if _hf_model_cached("sentence-transformers/all-MiniLM-L6-v2"):
                     os.environ.setdefault("HF_HUB_OFFLINE", "1")
                     print("model cache detected: HF_HUB_OFFLINE=1", file=sys.stderr)
-                from sentence_transformers import SentenceTransformer  # deferred heavy import
+                try:
+                    from sentence_transformers import SentenceTransformer  # deferred heavy import
+                except ImportError:
+                    raise ToolError(
+                        "semantic search needs the optional extra: "
+                        "pip install 'mcp-memory-bridge[semantic]' (or set MCP_EMBEDDINGS=off)"
+                    ) from None
 
                 _model = SentenceTransformer("all-MiniLM-L6-v2")
     # show_progress_bar=False: ST's default tqdm bar writes to stderr on
@@ -78,7 +99,7 @@ def _maybe_preload_model() -> None:
         try:
             _embed(["preload"])
             print("embedding model preloaded", file=sys.stderr)
-        except Exception as exc:  # noqa: BLE001 - preload falls back to lazy loading
+        except Exception as exc:
             print(f"embedding model preload failed: {exc}", file=sys.stderr)
 
     threading.Thread(target=_load, daemon=True).start()
